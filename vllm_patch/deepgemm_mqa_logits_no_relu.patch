@@ -1,0 +1,46 @@
+diff -ru a/include/deep_gemm/impls/sm100_fp8_mqa_logits.cuh b/include/deep_gemm/impls/sm100_fp8_mqa_logits.cuh
+--- a/include/deep_gemm/impls/sm100_fp8_mqa_logits.cuh
++++ b/include/deep_gemm/impls/sm100_fp8_mqa_logits.cuh
+@@ -1,3 +1,6 @@
++// JSSA-MLA scores with the plain weighted head sum; DSA's lightning indexer
++// applies a per-head ReLU. Remove the next line to restore the DSA behavior.
++#define DG_MQA_LOGITS_NO_RELU 1
+ #pragma once
+ 
+ #include <cutlass/arch/barrier.h>
+@@ -359,7 +362,12 @@
+                     auto sum_1 = make_float2(0, 0);
+ 
+                     const auto transform = [&](const uint32_t& j, const float2& sum) {
++                        #ifdef DG_MQA_LOGITS_NO_RELU
++                        // JSSA: plain weighted head sum (no per-head ReLU).
++                        auto a = make_float2(accum[j], accum[j + 1]);
++                        #else
+                         auto a = make_float2(fmaxf(accum[j], 0), fmaxf(accum[j + 1], 0));
++                        #endif
+                         auto b = make_float2(weights[i][j], weights[i][j + 1]);
+                         return __ffma2_rn(a, b, sum);
+                     };
+diff -ru a/include/deep_gemm/impls/sm100_fp8_paged_mqa_logits.cuh b/include/deep_gemm/impls/sm100_fp8_paged_mqa_logits.cuh
+--- a/include/deep_gemm/impls/sm100_fp8_paged_mqa_logits.cuh
++++ b/include/deep_gemm/impls/sm100_fp8_paged_mqa_logits.cuh
+@@ -1,3 +1,6 @@
++// JSSA-MLA scores with the plain weighted head sum; DSA's lightning indexer
++// applies a per-head ReLU. Remove the next line to restore the DSA behavior.
++#define DG_MQA_LOGITS_NO_RELU 1
+ #pragma once
+ 
+ #include <cutlass/arch/barrier.h>
+@@ -390,7 +393,12 @@
+                     auto sum_1 = make_float2(0, 0);
+ 
+                     const auto transform = [&](const uint32_t& j, const float2& sum) {
++                        #ifdef DG_MQA_LOGITS_NO_RELU
++                        // JSSA: plain weighted head sum (no per-head ReLU).
++                        auto a = make_float2(accum[j], accum[j + 1]);
++                        #else
+                         auto a = make_float2(fmaxf(accum[j], 0), fmaxf(accum[j + 1], 0));
++                        #endif
+                         auto b = make_float2(weights[i][j], weights[i][j + 1]);
+                         return __ffma2_rn(a, b, sum);
+                     };

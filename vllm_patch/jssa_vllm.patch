@@ -1,0 +1,3399 @@
+diff --git a/tests/v1/attention/test_jssa_decode.py b/tests/v1/attention/test_jssa_decode.py
+new file mode 100644
+index 000000000..f55dfcdf5
+--- /dev/null
++++ b/tests/v1/attention/test_jssa_decode.py
+@@ -0,0 +1,130 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Numerical tests for the JSSA decode path: FP8 projected-key store + score,
++and the gather-free indexed attention against a PyTorch reference."""
++
++import pytest
++import torch
++
++from vllm.v1.attention.ops.triton_jssa_gather import jssa_gather
++from vllm.v1.attention.ops.triton_jssa_indexed_attend import jssa_indexed_attend
++from vllm.v1.attention.ops.triton_jssa_score_topk import jssa_score, jssa_score_topk
++from vllm.v1.attention.ops.triton_jssa_store import (
++    jssa_project_and_store,
++    jssa_project_and_store_contig_fp8,
++)
++
++DEVICE = "cuda"
++
++
++def _orthonormal_basis(H_kv, r, d, dtype):
++    g = torch.randn(H_kv, d, r, device=DEVICE, dtype=torch.float32)
++    q, _ = torch.linalg.qr(g)  # [H_kv, d, r], orthonormal columns
++    return q.transpose(1, 2).contiguous().to(dtype)  # [H_kv, r, d]
++
++
++def _paged_setup(num_reqs, H_kv, d, seq_len, block_size, slot, dtype):
++    blocks_per_req = (seq_len + block_size - 1) // block_size
++    num_blocks = num_reqs * blocks_per_req + 3
++    kv_cache = torch.zeros(num_blocks, block_size, H_kv, slot, device=DEVICE, dtype=dtype)
++    # shuffled physical blocks
++    perm = torch.randperm(num_blocks - 3, device=DEVICE)[: num_reqs * blocks_per_req] + 3
++    block_table = perm.view(num_reqs, blocks_per_req).to(torch.int32)
++    pos = torch.arange(seq_len, device=DEVICE)
++    slot_mapping = torch.cat(
++        [block_table[r, pos // block_size].long() * block_size + pos % block_size
++         for r in range(num_reqs)]
++    )
++    K = torch.randn(num_reqs * seq_len, H_kv, d, device=DEVICE, dtype=dtype)
++    V = torch.randn(num_reqs * seq_len, H_kv, d, device=DEVICE, dtype=dtype)
++    return kv_cache, block_table, slot_mapping, K, V
++
++
++@pytest.mark.parametrize("d,r", [(128, 32), (512, 64)])
++def test_fp8_contig_score_matches_bf16(d, r):
++    torch.manual_seed(0)
++    dtype = torch.bfloat16
++    num_reqs, H_kv, seq_len, block_size = 2, 4, 1000, 16
++    kv_cache, bt, sm, K, V = _paged_setup(num_reqs, H_kv, d, seq_len, block_size, 2 * d, dtype)
++    M = _orthonormal_basis(H_kv, r, d, dtype)
++    projk = torch.zeros(kv_cache.shape[0], block_size, H_kv, r, device=DEVICE,
++                        dtype=torch.float8_e4m3fn)
++    scale = M.float().norm(dim=2).clamp_min(1e-6).to(dtype).contiguous()
++    jssa_project_and_store_contig_fp8(K, V, kv_cache, projk, scale, sm, M)
++    # K|V landed in the slot
++    blk, off = sm // block_size, sm % block_size
++    torch.testing.assert_close(kv_cache[blk, off, :, :d], K)
++    torch.testing.assert_close(kv_cache[blk, off, :, d:], V)
++
++    q = torch.randn(num_reqs, H_kv, d, device=DEVICE, dtype=dtype)
++    proj_q = torch.einsum("rhd,hcd->rhc", q.float(), M.float())
++    seq_lens = torch.full((num_reqs,), seq_len, device=DEVICE, dtype=torch.int32)
++    s8 = jssa_score((proj_q * scale.float().unsqueeze(0)).to(dtype), kv_cache, bt,
++                    seq_lens, d, r, projk_cache=projk)
++    ref = torch.einsum("rhc,rthc->rht", proj_q,
++                       torch.einsum("nhd,hcd->nhc", K.float(), M.float())
++                       .view(num_reqs, seq_len, H_kv, r))
++    got = s8[..., :seq_len]
++    rel = (got - ref).norm() / ref.norm()
++    assert rel < 0.08, f"fp8 score relative error {rel:.4f}"
++    assert torch.isinf(s8[..., seq_len:]).all()
++
++
++@pytest.mark.parametrize("G", [1, 4])
++@pytest.mark.parametrize("num_reqs", [1, 16])
++@pytest.mark.parametrize("d", [128, 512])
++def test_indexed_attend_matches_reference(G, num_reqs, d):
++    torch.manual_seed(1)
++    dtype = torch.bfloat16
++    H_kv, r, seq_len, block_size, n_fac = 2, 32, 3000, 16, 256
++    slot = 2 * d + r
++    kv_cache, bt, sm, K, V = _paged_setup(num_reqs, H_kv, d, seq_len, block_size, slot, dtype)
++    M = _orthonormal_basis(H_kv, r, d, dtype)
++    jssa_project_and_store(K, V, kv_cache, sm, M)
++
++    q = torch.randn(num_reqs, H_kv * G, d, device=DEVICE, dtype=dtype)
++    q_kv = q.view(num_reqs, H_kv, G, d).mean(dim=2)
++    proj_q = torch.einsum("rhd,hcd->rhc", q_kv.float(), M.float()).to(dtype)
++    seq_lens = torch.full((num_reqs,), seq_len, device=DEVICE, dtype=torch.int32)
++    top_idx, _ = jssa_score_topk(proj_q, kv_cache, bt, seq_lens, n_fac, d, r, use_radix=True)
++    assert top_idx.shape == (num_reqs, H_kv, n_fac)
++    # distinct, in-range selections
++    srt = top_idx.sort(dim=-1).values
++    assert (srt[..., 1:] != srt[..., :-1]).all()
++    assert (top_idx >= 0).all() and (top_idx < seq_len).all()
++
++    scale = d**-0.5
++    out = torch.empty_like(q)
++    jssa_indexed_attend(q, kv_cache, bt, top_idx, head_size=d, scale=scale, out=out)
++
++    # reference: gather + softmax attention per query head over its kv head's set
++    Ksel, Vsel = jssa_gather(kv_cache, bt, top_idx, head_size=d, dtype=dtype)
++    Ksel = Ksel.view(num_reqs, n_fac, H_kv, d).permute(0, 2, 1, 3).float()
++    Vsel = Vsel.view(num_reqs, n_fac, H_kv, d).permute(0, 2, 1, 3).float()
++    qg = q.view(num_reqs, H_kv, G, d).float()
++    p = torch.softmax(torch.einsum("nhgd,nhfd->nhgf", qg, Ksel) * scale, dim=-1)
++    ref = torch.einsum("nhgf,nhfd->nhgd", p, Vsel).reshape(num_reqs, H_kv * G, d)
++    torch.testing.assert_close(out.float(), ref, atol=2e-2, rtol=2e-2)
++
++    # the gathered rows are the cached K/V of the selected positions
++    r0, h0 = 0, 1
++    pos = top_idx[r0, h0].long()
++    torch.testing.assert_close(Ksel[r0, h0], K[r0 * seq_len + pos, h0].float())
++
++
++def test_radix_short_sequence_cycles_real_tokens():
++    torch.manual_seed(2)
++    dtype = torch.bfloat16
++    d, r, H_kv, block_size, n_fac = 128, 32, 2, 16, 64
++    seq_len = 20  # < n_fac
++    kv_cache, bt, sm, K, V = _paged_setup(1, H_kv, d, seq_len, block_size, 2 * d + r, dtype)
++    M = _orthonormal_basis(H_kv, r, d, dtype)
++    jssa_project_and_store(K, V, kv_cache, sm, M)
++    proj_q = torch.randn(1, H_kv, r, device=DEVICE, dtype=dtype)
++    seq_lens = torch.tensor([seq_len], device=DEVICE, dtype=torch.int32)
++    top_idx, _ = jssa_score_topk(proj_q, kv_cache, bt, seq_lens, n_fac, d, r, use_radix=True)
++    k_eff = top_idx.shape[-1]
++    assert (top_idx >= 0).all() and (top_idx < seq_len).all()
++    # every real token is selected at least once
++    for h in range(H_kv):
++        assert set(top_idx[0, h, :k_eff].tolist()) == set(range(seq_len))
+diff --git a/tests/v1/attention/test_jssa_gather.py b/tests/v1/attention/test_jssa_gather.py
+new file mode 100644
+index 000000000..331659e23
+--- /dev/null
++++ b/tests/v1/attention/test_jssa_gather.py
+@@ -0,0 +1,86 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Numerical test for the JSSA gather kernel.
++
++Builds a synthetic combined-slot KV cache + random top_idx, runs the Triton
++gather kernel, and compares against an eager PyTorch reference built from
++``torch.gather``.
++"""
++
++import pytest
++import torch
++
++from vllm.v1.attention.ops.triton_jssa_gather import jssa_gather
++from vllm.v1.attention.ops.triton_jssa_store import jssa_project_and_store
++
++
++@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
++def test_gather_matches_reference(dtype):
++    if not torch.cuda.is_available():
++        pytest.skip("CUDA required")
++
++    torch.manual_seed(0)
++    device = torch.device("cuda:0")
++    num_reqs, H_kv, head_size, cs_h = 2, 4, 128, 32
++    seq_len, block_size, n_fac = 96, 16, 20
++    blocks_per_req = (seq_len + block_size - 1) // block_size
++    num_blocks = num_reqs * blocks_per_req
++    slot_size = 2 * head_size + cs_h
++
++    kv_cache = torch.zeros(
++        num_blocks,
++        block_size,
++        H_kv,
++        slot_size,
++        dtype=dtype,
++        device=device,
++    )
++    K = torch.randn(num_reqs * seq_len, H_kv, head_size, dtype=dtype, device=device)
++    V = torch.randn(num_reqs * seq_len, H_kv, head_size, dtype=dtype, device=device)
++    M = torch.randn(H_kv, cs_h, head_size, dtype=dtype, device=device)
++    slot_mapping = torch.arange(num_reqs * seq_len, dtype=torch.int64, device=device)
++    jssa_project_and_store(K, V, kv_cache, slot_mapping, M)
++
++    block_table = torch.arange(
++        num_reqs * blocks_per_req,
++        dtype=torch.int32,
++        device=device,
++    ).view(num_reqs, blocks_per_req)
++
++    # Per (req, head) random selection of n_fac unique positions within seq_len.
++    top_idx = torch.empty(num_reqs, H_kv, n_fac, dtype=torch.int32, device=device)
++    for r in range(num_reqs):
++        for h in range(H_kv):
++            perm = torch.randperm(seq_len)[:n_fac]
++            top_idx[r, h] = perm.to(device=device, dtype=torch.int32)
++
++    K_sel, V_sel = jssa_gather(
++        kv_cache, block_table, top_idx, head_size=head_size, dtype=dtype
++    )
++
++    # Build eager reference from the original K, V tensors (request r has
++    # tokens at K[r*seq_len:(r+1)*seq_len, :, :]).
++    K_per_req = K.view(num_reqs, seq_len, H_kv, head_size)
++    V_per_req = V.view(num_reqs, seq_len, H_kv, head_size)
++
++    for r in range(num_reqs):
++        for h in range(H_kv):
++            for i in range(n_fac):
++                t = int(top_idx[r, h, i])
++                expected_K = K_per_req[r, t, h]
++                expected_V = V_per_req[r, t, h]
++                got_K = K_sel[r * n_fac + i, h]
++                got_V = V_sel[r * n_fac + i, h]
++                assert torch.equal(got_K, expected_K), (
++                    f"K mismatch at r={r} h={h} i={i} t={t}: "
++                    f"max abs diff {(got_K - expected_K).abs().max()}"
++                )
++                assert torch.equal(got_V, expected_V), (
++                    f"V mismatch at r={r} h={h} i={i} t={t}"
++                )
++
++
++if __name__ == "__main__":
++    test_gather_matches_reference(torch.bfloat16)
++    test_gather_matches_reference(torch.float16)
++    print("All gather tests passed.")
+diff --git a/tests/v1/attention/test_jssa_proj_k.py b/tests/v1/attention/test_jssa_proj_k.py
+new file mode 100644
+index 000000000..20ac13686
+--- /dev/null
++++ b/tests/v1/attention/test_jssa_proj_k.py
+@@ -0,0 +1,86 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Numerical test for the JSSA fused project + store kernel.
++
++Builds a small random (K, V, M) input, allocates a combined-slot KV cache,
++runs `jssa_project_and_store`, reads the proj_K region back from each slot,
++and asserts it matches the reference `einsum("nhd,hcd->nhc", K, M)`.
++"""
++
++import pytest
++import torch
++
++from vllm.v1.attention.ops.triton_jssa_store import jssa_project_and_store
++
++
++@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
++@pytest.mark.parametrize("head_size,cs_h", [(128, 32), (64, 16)])
++def test_jssa_project_and_store(dtype, head_size, cs_h):
++    if not torch.cuda.is_available():
++        pytest.skip("CUDA required")
++
++    device = torch.device("cuda:0")
++    torch.manual_seed(0)
++
++    num_tokens = 64
++    num_kv_heads = 8
++    num_blocks = 8
++    block_size = 16
++    slot_size = 2 * head_size + cs_h
++
++    key = torch.randn(num_tokens, num_kv_heads, head_size, dtype=dtype, device=device)
++    value = torch.randn(num_tokens, num_kv_heads, head_size, dtype=dtype, device=device)
++    M = torch.randn(num_kv_heads, cs_h, head_size, dtype=dtype, device=device)
++
++    kv_cache = torch.zeros(
++        num_blocks,
++        block_size,
++        num_kv_heads,
++        slot_size,
++        dtype=dtype,
++        device=device,
++    )
++
++    # Map token i → slot i (dense, contiguous).
++    slot_mapping = torch.arange(num_tokens, dtype=torch.int64, device=device)
++
++    jssa_project_and_store(key, value, kv_cache, slot_mapping, M)
++
++    # Read back K, V, proj_K from each token's slot and compare with refs.
++    K_ref = key
++    V_ref = value
++    proj_K_ref = torch.einsum("nhd,hcd->nhc", K_ref.float(), M.float()).to(dtype)
++
++    K_back = torch.empty_like(K_ref)
++    V_back = torch.empty_like(V_ref)
++    proj_K_back = torch.empty(
++        num_tokens, num_kv_heads, cs_h, dtype=dtype, device=device
++    )
++
++    for t in range(num_tokens):
++        slot = int(slot_mapping[t])
++        block = slot // block_size
++        pos = slot % block_size
++        K_back[t] = kv_cache[block, pos, :, :head_size]
++        V_back[t] = kv_cache[block, pos, :, head_size : 2 * head_size]
++        proj_K_back[t] = kv_cache[block, pos, :, 2 * head_size : 2 * head_size + cs_h]
++
++    # K and V should be exact (bit-identical copy).
++    assert torch.equal(K_back, K_ref), "K readback mismatch"
++    assert torch.equal(V_back, V_ref), "V readback mismatch"
++
++    # proj_K uses fp32 accumulation in the kernel vs einsum reference; allow
++    # some tolerance for bf16/fp16 cast at the end.
++    atol = 2e-2 if dtype == torch.bfloat16 else 5e-3
++    rtol = 5e-3
++    assert torch.allclose(proj_K_back, proj_K_ref, atol=atol, rtol=rtol), (
++        f"proj_K mismatch: max abs diff {(proj_K_back - proj_K_ref).abs().max().item()}"
++    )
++
++
++if __name__ == "__main__":
++    # Direct execution mode for quick smoke (no pytest harness).
++    test_jssa_project_and_store(torch.bfloat16, 128, 32)
++    test_jssa_project_and_store(torch.bfloat16, 64, 16)
++    test_jssa_project_and_store(torch.float16, 128, 32)
++    print("All proj_K tests passed.")
+diff --git a/tests/v1/attention/test_jssa_score_topk.py b/tests/v1/attention/test_jssa_score_topk.py
+new file mode 100644
+index 000000000..523883eea
+--- /dev/null
++++ b/tests/v1/attention/test_jssa_score_topk.py
+@@ -0,0 +1,173 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Numerical test for the JSSA score + top-K kernel.
++
++Builds a synthetic combined-slot KV cache + paged block_table, runs the
++Triton score kernel and ``torch.topk``, then compares against an eager
++PyTorch reference that gathers proj_K via ``index_select`` and computes
++the dot product directly.
++"""
++
++import pytest
++import torch
++
++from vllm.v1.attention.ops.triton_jssa_score_topk import (
++    jssa_score,
++    jssa_score_topk,
++)
++from vllm.v1.attention.ops.triton_jssa_store import jssa_project_and_store
++
++
++def _build_synthetic_cache(
++    num_reqs,
++    H_kv,
++    head_size,
++    cs_h,
++    seq_len,
++    block_size,
++    num_blocks,
++    dtype,
++    device,
++):
++    """Allocate combined-slot cache, populate it with `jssa_project_and_store`
++    using fresh random K, V, M. Returns (kv_cache, M, K, V, block_table, seq_lens)."""
++    torch.manual_seed(0)
++    slot_size = 2 * head_size + cs_h
++    kv_cache = torch.zeros(
++        num_blocks, block_size, H_kv, slot_size, dtype=dtype, device=device
++    )
++
++    K = torch.randn(num_reqs * seq_len, H_kv, head_size, dtype=dtype, device=device)
++    V = torch.randn(num_reqs * seq_len, H_kv, head_size, dtype=dtype, device=device)
++    M = torch.randn(H_kv, cs_h, head_size, dtype=dtype, device=device)
++
++    # Dense slot mapping: request r occupies slots [r*seq_len, (r+1)*seq_len)
++    slot_mapping = torch.arange(num_reqs * seq_len, dtype=torch.int64, device=device)
++    jssa_project_and_store(K, V, kv_cache, slot_mapping, M)
++
++    # Build block table: request r owns blocks
++    # [r * blocks_per_req, (r+1) * blocks_per_req)
++    blocks_per_req = (seq_len + block_size - 1) // block_size
++    block_table = torch.arange(
++        num_reqs * blocks_per_req,
++        dtype=torch.int32,
++        device=device,
++    ).view(num_reqs, blocks_per_req)
++    seq_lens = torch.full((num_reqs,), seq_len, dtype=torch.int32, device=device)
++
++    return kv_cache, M, K, V, block_table, seq_lens
++
++
++def _eager_score_reference(K, M, proj_q, num_reqs, seq_len):
++    """Pure-PyTorch reference: project K on-the-fly, score per (r,h,t)."""
++    # K shape (num_reqs*seq_len, H_kv, d), reshape to (num_reqs, seq_len, H_kv, d)
++    K_reshaped = K.view(num_reqs, seq_len, K.shape[1], K.shape[2])
++    proj_K_ref = torch.einsum("rthd,hcd->rthc", K_reshaped.float(), M.float())
++    # proj_q (num_reqs, H_kv, cs_h)
++    scores = torch.einsum("rhc,rthc->rht", proj_q.float(), proj_K_ref)
++    return scores  # (num_reqs, H_kv, seq_len)
++
++
++@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
++def test_score_matches_reference(dtype):
++    if not torch.cuda.is_available():
++        pytest.skip("CUDA required")
++
++    device = torch.device("cuda:0")
++    num_reqs, H_kv, head_size, cs_h = 4, 8, 128, 32
++    seq_len, block_size = 64, 16
++    num_blocks = num_reqs * ((seq_len + block_size - 1) // block_size)
++
++    kv_cache, M, K, V, block_table, seq_lens = _build_synthetic_cache(
++        num_reqs,
++        H_kv,
++        head_size,
++        cs_h,
++        seq_len,
++        block_size,
++        num_blocks,
++        dtype,
++        device,
++    )
++
++    proj_q = torch.randn(num_reqs, H_kv, cs_h, dtype=dtype, device=device)
++
++    scores = jssa_score(
++        proj_q, kv_cache, block_table, seq_lens, head_size=head_size, cs_h=cs_h
++    )
++    # Slice to actual seq_len; rest should be -inf.
++    scores_slice = scores[..., :seq_len]
++    scores_beyond = scores[..., seq_len:]
++    assert torch.isinf(scores_beyond).all() and (scores_beyond < 0).all(), (
++        "positions beyond seq_len must be -inf"
++    )
++
++    ref = _eager_score_reference(K, M, proj_q, num_reqs, seq_len)
++
++    # Allow generous tolerance: kernel uses fp32 accum then stores fp32;
++    # reference is full fp32. proj_K through bf16 round-trip is the main source
++    # of error.
++    atol = 5e-1 if dtype == torch.bfloat16 else 5e-2
++    rtol = 5e-2
++    max_diff = (scores_slice - ref).abs().max().item()
++    assert torch.allclose(scores_slice, ref, atol=atol, rtol=rtol), (
++        f"score mismatch: max abs diff {max_diff}"
++    )
++
++
++@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
++def test_topk_indices_match_reference(dtype):
++    if not torch.cuda.is_available():
++        pytest.skip("CUDA required")
++
++    device = torch.device("cuda:0")
++    num_reqs, H_kv, head_size, cs_h = 2, 4, 128, 32
++    seq_len, block_size = 128, 16
++    n_fac = 16
++    num_blocks = num_reqs * ((seq_len + block_size - 1) // block_size)
++
++    kv_cache, M, K, V, block_table, seq_lens = _build_synthetic_cache(
++        num_reqs,
++        H_kv,
++        head_size,
++        cs_h,
++        seq_len,
++        block_size,
++        num_blocks,
++        dtype,
++        device,
++    )
++
++    proj_q = torch.randn(num_reqs, H_kv, cs_h, dtype=dtype, device=device)
++
++    top_idx, top_scores = jssa_score_topk(
++        proj_q,
++        kv_cache,
++        block_table,
++        seq_lens,
++        n_fac=n_fac,
++        head_size=head_size,
++        cs_h=cs_h,
++    )
++
++    ref_scores = _eager_score_reference(K, M, proj_q, num_reqs, seq_len)
++    _, ref_idx = torch.topk(ref_scores, k=n_fac, dim=-1)
++
++    # We allow that ties may flip ordering between implementations. Compare
++    # as *sets*: the chosen positions should match within tolerance.
++    for r in range(num_reqs):
++        for h in range(H_kv):
++            ours = set(top_idx[r, h].tolist())
++            ref = set(ref_idx[r, h].tolist())
++            common = len(ours & ref)
++            assert common >= int(0.9 * n_fac), (
++                f"req {r} head {h}: only {common}/{n_fac} top-K positions match"
++            )
++
++
++if __name__ == "__main__":
++    test_score_matches_reference(torch.bfloat16)
++    test_score_matches_reference(torch.float16)
++    test_topk_indices_match_reference(torch.bfloat16)
++    test_topk_indices_match_reference(torch.float16)
++    print("All score+topk tests passed.")
+diff --git a/vllm/config/attention.py b/vllm/config/attention.py
+index 52ce9f102..2e7f2a11a 100644
+--- a/vllm/config/attention.py
++++ b/vllm/config/attention.py
+@@ -33,6 +33,52 @@ class AttentionConfig:
+     Fixes the split count so grid dimensions are constant across captures,
+     and buffers can be pre-allocated to avoid inflating the memory estimate."""
+ 
++    jssa_basis_path: str | None = None
++    """JSSA calibration file. GQA: ``{'M': {layer_idx: Tensor[H_kv, r, d]}}``;
++    MLA: ``{'M': {layer_idx: Tensor[1, r, kv_lora_rank]}}``. Layers absent from
++    the dict run dense attention."""
++
++    jssa_budget: int = 2048
++    """JSSA token budget B: number of cached tokens attended per decode step and
++    KV head (per layer for MLA)."""
++
++    jssa_rank: int | None = None
++    """JSSA subspace rank r. Default (None) is head_size // 4 for GQA (r=32 for
++    d=128) and 64 for MLA. Must match the calibrated basis (e.g. r=64 for the
++    head_dim=512 global layers of Gemma 4)."""
++
++    jssa_fp8_projk: bool = True
++    """GQA: store the projected-key scoring cache in FP8 (e4m3), in a separate
++    contiguous [num_blocks, block_size, H_kv, r] cache with a per-(head, channel)
++    scale (the row norm of M) folded into the projected query. Only the
++    selection uses FP8; attention reads the BF16 K/V. This cache is allocated
++    outside vLLM's KV-cache budget (r bytes per token and KV head). False: bf16
++    proj_K inside the combined KV slot. (MLA always scores from the FP8 indexer
++    cache of DeepSeek Sparse Attention.)"""
++
++    jssa_indexed_attend: bool = True
++    """GQA: gather-free indexed attention for decode (stream the selected paged
++    slots through an online-softmax kernel instead of materializing K_sel/V_sel
++    and running flash attention on them). Cases the kernel does not cover
++    (sinks, softcap, alibi, non-power-of-2 GQA groups) fall back to gather +
++    flash attention. False forces gather + flash attention."""
++
++    jssa_indexed_min_batch: int = 1
++    """Minimum decode batch for the gather-free kernel; below it, gather + flash
++    attention is used."""
++
++    jssa_mla: bool = False
++    """Apply JSSA to an MLA model (DeepSeek-V2/V3-style attention: GLM-4.7-Flash,
++    GLM-5.2, DeepSeek-V3.x). A JSSAMLAIndexer scores [M c_KV | k_pe] against
++    [M W_UK^T q_nope | q_pe] and writes the top-B token indices for the
++    FlashMLA sparse attention. Replaces a native DSA indexer when present."""
++
++    jssa_mla_collect_grams: bool = False
++    """MLA calibration mode (dense attention, enforce_eager): accumulate the
++    per-layer second moments of the group-mean absorbed query and of the latent
++    c_KV during prefill. Used by the in-vLLM calibration driver for models that
++    are served with tensor parallelism."""
++
+     use_trtllm_attention: bool | None = None
+     """If set to True/False, use or don't use the TRTLLM attention backend
+     in flashinfer. If None, auto-detect the attention backend in flashinfer."""
+diff --git a/vllm/config/cache.py b/vllm/config/cache.py
+index 4fa7e1cfc..27b4f0114 100644
+--- a/vllm/config/cache.py
++++ b/vllm/config/cache.py
+@@ -28,6 +28,7 @@ CacheDType = Literal[
+     "turboquant_4bit_nc",
+     "turboquant_k3v4_nc",
+     "turboquant_3bit_nc",
++    "jssa",
+     "int8_per_token_head",
+     "fp8_per_token_head",
+     "nvfp4",
+diff --git a/vllm/engine/arg_utils.py b/vllm/engine/arg_utils.py
+index aa82b70eb..ecea7b700 100644
+--- a/vllm/engine/arg_utils.py
++++ b/vllm/engine/arg_utils.py
+@@ -1773,6 +1773,18 @@ class EngineArgs:
+                 existing | set(boundary), key=int
+             )
+ 
++        # The JSSA GQA backend owns a combined-slot, full-context KV layout. On
++        # hybrid models (Gemma 4) that layout would store the sliding-window
++        # layers at full context length, whereas Full-KV window-bounds them via
++        # SlidingWindowSpec. Add "sliding_window" to the skip list so those
++        # layers use the standard backend and a window-bounded cache
++        # (output-invariant: sliding attention is windowed either way). No-op
++        # for models without sliding-window layers and for MLA models.
++        if resolved_cache_dtype == "jssa":
++            cache_config.kv_cache_dtype_skip_layers = list(
++                set(cache_config.kv_cache_dtype_skip_layers) | {"sliding_window"}
++            )
++
+         ray_runtime_env = None
+         if is_ray_initialized():
+             # Ray Serve LLM calls `create_engine_config` in the context
+diff --git a/vllm/model_executor/layers/attention/attention.py b/vllm/model_executor/layers/attention/attention.py
+index 2e17a55ce..e49e1228a 100644
+--- a/vllm/model_executor/layers/attention/attention.py
++++ b/vllm/model_executor/layers/attention/attention.py
+@@ -569,7 +569,11 @@ class Attention(nn.Module, AttentionLayerBase):
+         # Should not be called for enc-dec or encoder-only attention.
+         assert self.attn_type == AttentionType.DECODER
+         quant_mode = get_kv_quant_mode(self.kv_cache_dtype)
+-        if self.sliding_window is not None:
++        # Sliding-window layers that stay on the JSSA backend use the same
++        # combined-slot spec as the global layers (so page sizes unify); the
++        # window is applied at attention time. (By default engine args route
++        # sliding-window layers of hybrid models to the standard backend.)
++        if self.sliding_window is not None and self.kv_cache_dtype != "jssa":
+             assert not vllm_config.model_config.use_mla, (
+                 "MLA is not supported for slidingwindow"
+             )
+@@ -599,6 +603,37 @@ class Attention(nn.Module, AttentionLayerBase):
+                 dtype=self.kv_cache_torch_dtype,
+                 tq_slot_size=tq_config.slot_size_aligned,
+             )
++        elif self.kv_cache_dtype == "jssa":
++            # JSSA combined slot: [ K (head_size) | V (head_size) | proj_K (r) ].
++            # The proj_K region is 0-wide when proj_K lives in the separate FP8
++            # cache (head_size <= 256); must match the backend's slot size. The
++            # spec is built outside set_current_vllm_config(), so read the passed
++            # vllm_config.
++            from vllm.utils.torch_utils import get_dtype_size
++            from vllm.v1.attention.backends.jssa_attn import (
++                align_slot_elems,
++                default_rank,
++                fp8_projk_in_separate_cache,
++            )
++            from vllm.v1.kv_cache_interface import JSSAFullAttentionSpec
++
++            _ac = vllm_config.attention_config
++            _rank = getattr(_ac, "jssa_rank", None) or default_rank(self.head_size)
++            _separate = fp8_projk_in_separate_cache(
++                getattr(_ac, "jssa_fp8_projk", False), self.head_size
++            )
++            slot_elems = align_slot_elems(
++                2 * self.head_size + (0 if _separate else _rank)
++            )
++            dtype_size = get_dtype_size(self.kv_cache_torch_dtype)
++            return JSSAFullAttentionSpec(
++                block_size=block_size,
++                num_kv_heads=self.num_kv_heads,
++                head_size=self.head_size,
++                head_size_v=self.head_size,
++                dtype=self.kv_cache_torch_dtype,
++                jssa_slot_size=slot_elems * dtype_size,
++            )
+         else:
+             return FullAttentionSpec(
+                 block_size=block_size,
+diff --git a/vllm/model_executor/layers/jssa_mla_indexer.py b/vllm/model_executor/layers/jssa_mla_indexer.py
+new file mode 100644
+index 000000000..e634464e4
+--- /dev/null
++++ b/vllm/model_executor/layers/jssa_mla_indexer.py
+@@ -0,0 +1,242 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""JSSA token selection for Multi-head Latent Attention (MLA).
++
++Drop-in replacement for the DeepSeek-V3.2 lightning indexer: it writes the
++top-B token indices of every query into the shared ``topk_indices_buffer``
++through the same FP8 paged-MQA-logits + radix top-k op
++(``SparseAttnIndexer``), which the FlashMLA sparse attention consumes unchanged.
++Only the scoring representation differs:
++
++    index_q[h] = [ M W_UK[h]^T q_nope[h] | q_pe[h] ]
++    index_k    = [ M c_KV                | k_pe    ]
++
++so ``sum_h index_q[h] . index_k`` = (M sum_h q_latent[h]) . (M c_KV) + the
++decoupled-RoPE term, with q_latent[h] = W_UK[h]^T q_nope[h] the absorbed query.
++M [r, kv_lora_rank] is the calibrated per-layer basis (r = 64 latent dims plus
++64 RoPE dims = 128, the DSA index head dim). The selection is one token set per
++layer (MLA has a single shared latent KV head).
++
++NOTE: the DeepGEMM MQA-logits epilogue applies a per-head ReLU (DSA's indexer
++is trained with it). JSSA's score is the plain head sum, so the ReLU must be
++compiled out (see the DeepGEMM header patch shipped with this code).
++
++``JSSAMLAGramCollector`` is the calibration counterpart: attached to each MLA
++layer in dense-attention mode, it accumulates the second moments of the
++group-mean absorbed query and of c_KV, from which the basis is computed offline.
++"""
++
++from __future__ import annotations
++
++import torch
++from torch import nn
++
++from vllm.config import CacheConfig, VllmConfig
++from vllm.model_executor.layers.quantization.utils.fp8_utils import (
++    per_token_group_quant_fp8,
++)
++from vllm.model_executor.layers.sparse_attn_indexer import SparseAttnIndexer
++from vllm.model_executor.models.utils import extract_layer_index
++
++
++def _w_uk_bf16(owner, kv_b_proj, n_head, qk_nope_head_dim, v_head_dim, kv_lora_rank):
++    """bf16 W_UK (the qk_nope slice of kv_b_proj), [H_local, qk_nope, kv_lora].
++    Computed once and cached on ``owner``.
++
++    For FP8 checkpoints, vLLM's process_weights_after_loading rewrites the
++    block scales into a kernel-specific format, so a manual
++    ``weight * weight_scale_inv`` dequant is wrong. Instead pass the identity
++    through the module's own linear: kv_b_proj(I) = W^T. H is TP-local
++    (kv_b_proj is column-parallel)."""
++    cached = getattr(owner, "_wuk_bf16", None)
++    if cached is not None:
++        return cached
++    W = kv_b_proj.weight
++    if W.dtype == torch.float8_e4m3fn:
++        eye = torch.eye(kv_lora_rank, device=W.device, dtype=torch.bfloat16)
++        Wt = kv_b_proj(eye)[0]  # [kv_lora, H_local * (nope + v)] = W^T
++        Wbf = Wt.t().contiguous().to(torch.bfloat16)
++    else:
++        Wbf = W.to(torch.bfloat16)
++    W_UK = Wbf.view(n_head, qk_nope_head_dim + v_head_dim, kv_lora_rank)[
++        :, :qk_nope_head_dim, :
++    ].contiguous()
++    owner._wuk_bf16 = W_UK
++    return W_UK
++
++
++class JSSAMLAIndexer(nn.Module):
++    # Tells the MLA wrapper to pass its already-computed q / c_KV / k_pe.
++    is_jssa = True
++
++    def __init__(
++        self,
++        vllm_config: VllmConfig,
++        config,
++        cache_config: CacheConfig,
++        kv_b_proj: nn.Module,
++        basis_path: str,
++        cs_h: int,
++        n_fac: int,
++        topk_indices_buffer: torch.Tensor | None,
++        prefix: str = "",
++    ):
++        super().__init__()
++        from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
++        from vllm.v1.attention.backends.mla.indexer import get_max_prefill_buffer_size
++
++        self.kv_lora_rank = config.kv_lora_rank
++        self.qk_rope_head_dim = config.qk_rope_head_dim
++        self.qk_nope_head_dim = config.qk_nope_head_dim
++        self.v_head_dim = config.v_head_dim
++        # TP-local heads (q_b_proj / kv_b_proj are column-parallel).
++        self.n_head = (
++            config.num_attention_heads // vllm_config.parallel_config.tensor_parallel_size
++        )
++        # The DeepGEMM logits kernel supports 32 or 64 (padded) query heads.
++        assert self.n_head <= 64, f"JSSA-MLA: {self.n_head} local heads > 64"
++        self.cs_h = cs_h
++        self.head_dim = cs_h + self.qk_rope_head_dim  # index dim (128 at r=64)
++        self.softmax_scale = self.head_dim**-0.5
++        self.topk_tokens = n_fac
++        self.quant_block_size = 128
++        self.scale_fmt = "ue8m0"
++        self.kv_b_proj = kv_b_proj
++        self.layer_idx = extract_layer_index(prefix)
++        self.topk_indices_buffer = topk_indices_buffer  # read by the MLA wrapper
++
++        # Load M at construction (torch.load is not traceable) straight onto the
++        # worker's device: a non-persistent CPU buffer would not be moved by
++        # weight loading and would force a copy inside the captured graph.
++        if basis_path is None:
++            raise RuntimeError("JSSA-MLA requires attention_config.jssa_basis_path.")
++        ckpt = torch.load(basis_path, map_location="cpu", weights_only=False)
++        M0 = ckpt["M"][self.layer_idx][0]  # [r, kv_lora_rank]
++        if tuple(M0.shape) != (cs_h, self.kv_lora_rank):
++            raise RuntimeError(
++                f"JSSA-MLA basis M[{self.layer_idx}] shape {tuple(M0.shape)} != "
++                f"expected {(cs_h, self.kv_lora_rank)}."
++            )
++        _dev = torch.cuda.current_device() if torch.cuda.is_available() else "cpu"
++        self.register_buffer(
++            "M_basis", M0.to(torch.bfloat16).to(_dev).contiguous(), persistent=False
++        )
++        torch._dynamo.mark_static_address(self.M_basis)
++
++        # Reuse the DSA FP8 index cache and the FP8 paged-logits / radix top-k op.
++        self.k_cache = DeepseekV32IndexerCache(
++            head_dim=self.head_dim + self.head_dim // self.quant_block_size * 4,
++            dtype=torch.uint8,
++            prefix=f"{prefix}.k_cache",
++            cache_config=cache_config,
++        )
++        self.indexer_op = SparseAttnIndexer(
++            self.k_cache,
++            self.quant_block_size,
++            self.scale_fmt,
++            self.topk_tokens,
++            self.head_dim,
++            vllm_config.model_config.max_model_len,
++            get_max_prefill_buffer_size(vllm_config),
++            topk_indices_buffer,
++        )
++
++    def forward(self, hidden_states, q, kv_c, k_pe):
++        """q [T, H, nope + rope] (RoPE slice rotated), kv_c [T, kv_lora] (normed
++        latent), k_pe [T, 1, rope] (rotated)."""
++        T = q.shape[0]
++        H = self.n_head
++        q_nope = q[..., : self.qk_nope_head_dim]  # [T, H, nope]
++        q_pe = q[..., self.qk_nope_head_dim :]  # [T, H, rope]
++        k_pe = k_pe.reshape(T, self.qk_rope_head_dim)
++        Mb = self.M_basis
++        # Fused query projection: proj_q = q_nope @ (W_UK M^T), with
++        # WM = W_UK @ M^T [H, nope, r] cached (identical by associativity to
++        # projecting the [T, H, kv_lora] absorbed query).
++        WM = getattr(self, "_wm", None)
++        if WM is None:
++            W_UK = _w_uk_bf16(
++                self, self.kv_b_proj, H, self.qk_nope_head_dim, self.v_head_dim,
++                self.kv_lora_rank,
++            )
++            WM = torch.einsum("hnl,cl->hnc", W_UK, Mb).contiguous()
++            self._wm = WM
++        proj_q = torch.einsum("thn,hnc->thc", q_nope, WM)  # [T, H, r]
++        proj_K = kv_c @ Mb.T  # [T, r]
++        index_q = torch.cat([proj_q, q_pe], dim=-1)  # [T, H, head_dim]
++        index_k = torch.cat([proj_K, k_pe], dim=-1)  # [T, head_dim]
++        # Zero-pad the query heads to 32/64 (kernel constraint); padded heads
++        # get weight 0, so the score is exactly the sum over the H real heads.
++        H_pad = 32 if H <= 32 else 64
++        if H_pad != H:
++            index_q = torch.nn.functional.pad(index_q, (0, 0, 0, H_pad - H))
++        qf = index_q.reshape(-1, self.head_dim)
++        q_fp8, q_scale = per_token_group_quant_fp8(
++            qf, self.quant_block_size, column_major_scales=False, use_ue8m0=True
++        )
++        q_fp8 = q_fp8.view(T, H_pad, self.head_dim)
++        q_scale = q_scale.view(T, H_pad, 1)
++        # Uniform head weights (the fp8 q scale is folded in).
++        weights = (q_scale * self.softmax_scale * (H**-0.5)).squeeze(-1)  # [T, H_pad]
++        if H_pad != H:
++            weights[:, H:] = 0
++        return self.indexer_op(hidden_states, q_fp8, index_k, weights)
++
++
++class JSSAMLAGramCollector(nn.Module):
++    """Calibration-time accumulator for one MLA layer (dense attention, eager).
++
++    Accumulates, over all tokens passed through the layer,
++        G_Qm = sum_t q_bar_t q_bar_t^T,  q_bar_t = mean_h W_UK[h]^T q_nope[h, t]
++        G_K  = sum_t c_t c_t^T
++    in float64. q_bar is the mean over ALL attention heads: with tensor
++    parallelism the per-rank head sums are all-reduced first, so every rank
++    ends up with the same G_Qm. c_KV is replicated across ranks.
++    """
++
++    def __init__(self, config, kv_b_proj: nn.Module, layer_idx: int):
++        super().__init__()
++        from vllm.distributed import get_tensor_model_parallel_world_size
++
++        self.tp_size = get_tensor_model_parallel_world_size()
++        self.kv_lora_rank = config.kv_lora_rank
++        self.qk_nope_head_dim = config.qk_nope_head_dim
++        self.v_head_dim = config.v_head_dim
++        self.n_head_total = config.num_attention_heads
++        self.n_head = config.num_attention_heads // self.tp_size
++        self.layer_idx = layer_idx
++        # Plain reference (not a submodule): kv_b_proj is owned by the attention.
++        self._kv_b_proj = (kv_b_proj,)
++        self.g_q: torch.Tensor | None = None
++        self.g_k: torch.Tensor | None = None
++        self.num_tokens = 0
++
++    def reset(self) -> None:
++        self.g_q = None
++        self.g_k = None
++        self.num_tokens = 0
++
++    @torch.no_grad()
++    def forward(self, q: torch.Tensor, kv_c: torch.Tensor) -> None:
++        T = q.shape[0]
++        if T == 0:
++            return
++        W_UK = _w_uk_bf16(
++            self, self._kv_b_proj[0], self.n_head, self.qk_nope_head_dim,
++            self.v_head_dim, self.kv_lora_rank,
++        )
++        q_nope = q[..., : self.qk_nope_head_dim].float()
++        head_sum = torch.einsum("thn,hnl->tl", q_nope, W_UK.float())  # [T, kv_lora]
++        if self.tp_size > 1:
++            from vllm.distributed import tensor_model_parallel_all_reduce
++
++            head_sum = tensor_model_parallel_all_reduce(head_sum)
++        q_bar = head_sum / self.n_head_total
++        c = kv_c.float()
++        if self.g_q is None:
++            d = self.kv_lora_rank
++            self.g_q = torch.zeros(d, d, dtype=torch.float64, device=q.device)
++            self.g_k = torch.zeros(d, d, dtype=torch.float64, device=q.device)
++        self.g_q += (q_bar.T @ q_bar).double()
++        self.g_k += (c.T @ c).double()
++        self.num_tokens += T
+diff --git a/vllm/model_executor/layers/mla.py b/vllm/model_executor/layers/mla.py
+index 856f6bb8a..0c770b820 100644
+--- a/vllm/model_executor/layers/mla.py
++++ b/vllm/model_executor/layers/mla.py
+@@ -166,7 +166,17 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
+             )
+ 
+         if self.indexer and self.is_sparse and not self.skip_topk:
+-            self.indexer(hidden_states, q_c, positions, self.indexer_rope_emb)
++            if getattr(self.indexer, "is_jssa", False):
++                # The JSSA selector reuses the tensors computed above: q (its
++                # RoPE slice already rotated), the normed latent kv_c, and k_pe.
++                self.indexer(hidden_states, q, kv_c_normed, k_pe)
++            else:
++                self.indexer(hidden_states, q_c, positions, self.indexer_rope_emb)
++
++        gram_collector = getattr(self, "jssa_gram_collector", None)
++        if gram_collector is not None:
++            # JSSA calibration mode (dense attention, eager): accumulate Grams.
++            gram_collector(q, kv_c_normed)
+ 
+         if llama_4_scaling is not None:
+             q *= llama_4_scaling
+diff --git a/vllm/model_executor/models/deepseek_v2.py b/vllm/model_executor/models/deepseek_v2.py
+index 44797874a..ce2ceb223 100644
+--- a/vllm/model_executor/models/deepseek_v2.py
++++ b/vllm/model_executor/models/deepseek_v2.py
+@@ -985,24 +985,50 @@ class DeepseekV2MLAAttention(nn.Module):
+ 
+         self.is_v32 = hasattr(config, "index_topk")
+ 
++        # JSSA on MLA replaces the native DSA indexer (if any). The calibration
++        # mode (jssa_mla_collect_grams) runs the model with dense attention.
++        _ac = vllm_config.attention_config
++        _use_jssa = bool(getattr(_ac, "jssa_mla", False))
++        _collect_grams = bool(getattr(_ac, "jssa_mla_collect_grams", False))
++
+         _skip_topk = False
+-        if self.is_v32:
+-            self.indexer_rope_emb = get_rope(
+-                qk_rope_head_dim,
+-                max_position=max_position_embeddings,
+-                rope_parameters=config.rope_parameters,
+-                is_neox_style=not getattr(config, "indexer_rope_interleave", False),
+-            )
+-            self.indexer = Indexer(
+-                vllm_config,
+-                config,
+-                hidden_size,
+-                q_lora_rank,
+-                quant_config,
+-                cache_config,
+-                topk_indices_buffer,
+-                f"{prefix}.indexer",
+-            )
++        if self.is_v32 and not _use_jssa and not _collect_grams:
++            # GLM-5.2 (glm_moe_dsa): ``config.indexer_types`` marks each layer
++            # 'full' (it has its own lightning indexer) or 'shared' (no indexer
++            # weights; it reuses the top-k of the most recent 'full' layer via the
++            # shared topk_indices_buffer). Building an Indexer on 'shared' layers
++            # would run it with uninitialized weights.
++            _itypes = getattr(config, "indexer_types", None)
++            if _itypes is not None:
++                _lid = extract_layer_index(prefix)
++                if 0 <= _lid < len(_itypes):
++                    _skip_topk = _itypes[_lid] != "full"
++            if _skip_topk:
++                self.indexer_rope_emb = None
++                # On a skip_topk layer the indexer is never called; the MLA
++                # wrapper only reads `.topk_tokens` and `.topk_indices_buffer`.
++                import types
++                self.indexer = types.SimpleNamespace(
++                    topk_tokens=config.index_topk,
++                    topk_indices_buffer=topk_indices_buffer,
++                )
++            else:
++                self.indexer_rope_emb = get_rope(
++                    qk_rope_head_dim,
++                    max_position=max_position_embeddings,
++                    rope_parameters=config.rope_parameters,
++                    is_neox_style=not getattr(config, "indexer_rope_interleave", False),
++                )
++                self.indexer = Indexer(
++                    vllm_config,
++                    config,
++                    hidden_size,
++                    q_lora_rank,
++                    quant_config,
++                    cache_config,
++                    topk_indices_buffer,
++                    f"{prefix}.indexer",
++                )
+ 
+             # Enable IndexCache for DeepSeek models to reduce redundant top-k
+             # token selection computations in sparse attention.
+@@ -1022,6 +1048,31 @@ class DeepseekV2MLAAttention(nn.Module):
+             self.indexer_rope_emb = None
+             self.indexer = None
+ 
++        if _use_jssa:
++            from vllm.model_executor.layers.jssa_mla_indexer import JSSAMLAIndexer
++
++            self.indexer = JSSAMLAIndexer(
++                vllm_config=vllm_config,
++                config=config,
++                cache_config=cache_config,
++                kv_b_proj=self.kv_b_proj,
++                basis_path=_ac.jssa_basis_path,
++                cs_h=_ac.jssa_rank or (config.kv_lora_rank // 8),
++                n_fac=_ac.jssa_budget,
++                topk_indices_buffer=topk_indices_buffer,
++                prefix=f"{prefix}.jssa_indexer",
++            )
++            self.indexer_rope_emb = None
++            # Route the layer through the sparse MLA attention + top-k buffer.
++            self.is_v32 = True
++            _skip_topk = False
++
++        if _collect_grams:
++            # Dense attention; the gram collector is attached to the wrapper below.
++            self.indexer = None
++            self.indexer_rope_emb = None
++            self.is_v32 = False
++
+         mla_modules = MLAModules(
+             kv_a_layernorm=self.kv_a_layernorm,
+             kv_b_proj=self.kv_b_proj,
+@@ -1057,6 +1108,16 @@ class DeepseekV2MLAAttention(nn.Module):
+             prefix,
+             skip_topk=_skip_topk,
+         )
++        if _collect_grams:
++            from vllm.model_executor.layers.jssa_mla_indexer import (
++                JSSAMLAGramCollector,
++            )
++
++            self.mla_attn.jssa_gram_collector = JSSAMLAGramCollector(
++                config=config,
++                kv_b_proj=self.kv_b_proj,
++                layer_idx=extract_layer_index(prefix),
++            )
+ 
+     def forward(
+         self,
+@@ -1215,8 +1276,17 @@ class DeepseekV2Model(nn.Module):
+ 
+         self.vocab_size = config.vocab_size
+         self.is_v32 = hasattr(config, "index_topk")
+-        if self.is_v32:
+-            topk_tokens = config.index_topk
++        # JSSA turns a dense MLA model (e.g. DeepSeek-V3.1, no index_topk) into a
++        # sparse one, so the shared top-k buffer is also needed without v3.2.
++        # It is sized by the JSSA token budget.
++        _ac = vllm_config.attention_config
++        _jssa_mla = bool(getattr(_ac, "jssa_mla", False))
++        if self.is_v32 or _jssa_mla:
++            topk_tokens = (
++                _ac.jssa_budget
++                if _jssa_mla
++                else getattr(config, "index_topk", None)
++            )
+             topk_indices_buffer = torch.empty(
+                 vllm_config.scheduler_config.max_num_batched_tokens,
+                 topk_tokens,
+@@ -1375,9 +1445,19 @@ class DeepseekV2Model(nn.Module):
+ 
+         params_dict = dict(self.named_parameters())
+         loaded_params: set[str] = set()
++        # When JSSA (or the dense calibration mode) replaced the native DSA
++        # lightning indexer, its checkpoint weights
++        # (self_attn.indexer.{k_norm,wk,weights_proj} / self_attn.indexers_proj)
++        # have no home. Detect its absence once and drop those weights before any
++        # params_dict lookup. Self-gating: on a native-DSA run the params exist,
++        # so nothing is skipped. The JSSA indexer lives under
++        # self_attn.jssa_indexer, which does not match.
++        _no_native_indexer = not any(".self_attn.indexer" in k for k in params_dict)
+         for name, loaded_weight in weights:
+             if "rotary_emb.inv_freq" in name:
+                 continue
++            if _no_native_indexer and ".self_attn.indexer" in name:
++                continue
+ 
+             spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
+             if spec_layer is not None:
+@@ -1535,6 +1615,16 @@ class DeepseekV2Model(nn.Module):
+                         if is_pp_missing_parameter(name, self):
+                             continue
+ 
++                        # Native DSA lightning-indexer weights have no home when
++                        # JSSA (or the dense calibration mode) replaced the native
++                        # Indexer. Self-gating: present in params_dict on a
++                        # native-DSA run -> drop them only when absent.
++                        if name not in params_dict and (
++                            ".self_attn.indexer." in name
++                            or ".self_attn.indexers_proj" in name
++                        ):
++                            continue
++
+                         param = params_dict[name]
+                         weight_loader = getattr(
+                             param, "weight_loader", default_weight_loader
+diff --git a/vllm/model_executor/models/glm4_moe_lite.py b/vllm/model_executor/models/glm4_moe_lite.py
+index 77aaa179a..151cbcd43 100644
+--- a/vllm/model_executor/models/glm4_moe_lite.py
++++ b/vllm/model_executor/models/glm4_moe_lite.py
+@@ -221,8 +221,12 @@ class Glm4MoeLiteModel(nn.Module):
+ 
+         self.vocab_size = config.vocab_size
+         self.is_v32 = hasattr(config, "index_topk")
+-        if self.is_v32:
+-            topk_tokens = config.index_topk
++        # JSSA on MLA needs the shared top-k buffer for the sparse MLA attention
++        # even though GLM-4.7-Flash has no native index_topk.
++        jssa_mla = bool(getattr(vllm_config.attention_config, "jssa_mla", False))
++        if self.is_v32 or jssa_mla:
++            topk_tokens = (vllm_config.attention_config.jssa_budget if jssa_mla
++                           else config.index_topk)
+             topk_indices_buffer = torch.empty(
+                 vllm_config.scheduler_config.max_num_batched_tokens,
+                 topk_tokens,
+diff --git a/vllm/utils/torch_utils.py b/vllm/utils/torch_utils.py
+index 12ec5b0fc..ae3658552 100644
+--- a/vllm/utils/torch_utils.py
++++ b/vllm/utils/torch_utils.py
+@@ -47,6 +47,7 @@ STR_DTYPE_TO_TORCH_DTYPE = {
+     "turboquant_4bit_nc": torch.uint8,
+     "turboquant_k3v4_nc": torch.uint8,
+     "turboquant_3bit_nc": torch.uint8,
++    "jssa": torch.bfloat16,
+     "nvfp4": torch.uint8,
+ }
+ 
+diff --git a/vllm/v1/attention/backends/jssa_attn.py b/vllm/v1/attention/backends/jssa_attn.py
+new file mode 100644
+index 000000000..d05952814
+--- /dev/null
++++ b/vllm/v1/attention/backends/jssa_attn.py
+@@ -0,0 +1,866 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""JSSA (Joint Subspace Sparse Attention) backend for GQA decoder layers.
++
++Decode step for one layer (q_len == 1 per request):
++
++  1. q_bar = mean of the G query heads that share a KV head      [H_kv, d]
++  2. proj_q = M q_bar, with M the calibrated [H_kv, r, d] basis   [H_kv, r]
++  3. score[t] = proj_q . proj_K[t] for every cached token t, where
++     proj_K = M k is written once per token at KV-cache-update time
++  4. top-B tokens per (request, KV head)   (radix top-k)
++  5. exact full-dimensional attention of every query head over the B tokens
++     selected for its KV head (gather-free indexed kernel, or gather + flash)
++
++Prefill and mixed prefill/decode batches run dense attention. Layers without a
++basis entry (e.g. the sliding-window layers of hybrid models) and sliding-window
++layers run dense attention over their own window.
++
++KV cache layout: one combined slot per (token, KV head),
++  [ K (d) | V (d) | proj_K (r) | pad ]            bf16 projected-key cache
++  [ K (d) | V (d) ]  + separate [.., H_kv, r] fp8  fp8 projected-key cache
++proj_K lives in the slot unless ``jssa_fp8_projk`` is set, in which case it is
++stored in a separate contiguous FP8 cache (coalesced score scan). For
++head_size > 256 the slot keeps its (unused) proj_K region in FP8 mode as well,
++so that the KV spec in ``attention.py`` and the backend agree on the slot size.
++
++Naming: ``n_fac`` is the token budget B and ``cs_h`` the subspace rank r.
++
++The all-decode branch is the one captured under CUDA graphs
++(``UNIFORM_SINGLE_TOKEN_DECODE``); every buffer it touches is pre-allocated
++and ``mark_static_address``-ed so replays see stable pointers.
++"""
++
++from dataclasses import dataclass
++from typing import ClassVar
++
++import torch
++
++from vllm.config import VllmConfig, get_current_vllm_config
++from vllm.config.cache import CacheDType
++from vllm.platforms.interface import DeviceCapability
++from vllm.v1.attention.backend import (
++    AttentionBackend,
++    AttentionCGSupport,
++    AttentionImpl,
++    AttentionMetadata,
++    AttentionMetadataBuilder,
++    AttentionType,
++    CommonAttentionMetadata,
++    MultipleOf,
++)
++from vllm.v1.attention.backends.fa_utils import (
++    flash_attn_varlen_func,
++    is_flash_attn_varlen_func_available,
++)
++from vllm.v1.attention.backends.utils import split_decodes_and_prefills
++from vllm.v1.attention.ops.triton_jssa_gather import jssa_gather
++from vllm.v1.attention.ops.triton_jssa_score_topk import jssa_score_topk
++from vllm.v1.attention.ops.triton_jssa_store import (
++    jssa_project_and_store,
++    jssa_project_and_store_contig_fp8,
++    jssa_store,
++)
++
++# vLLM's Triton flash attention: head_dim-agnostic (Gemma 4 full-attention
++# layers use head_dim=512, above FlashAttention's 256 cap) and O(L) memory.
++from vllm.v1.attention.ops.triton_unified_attention import unified_attention
++from vllm.v1.kv_cache_interface import AttentionSpec
++
++_HAS_FLASH_ATTN = is_flash_attn_varlen_func_available()
++
++
++def default_rank(head_size: int) -> int:
++    """Default subspace rank r = head_size // 4 (r = 32 for d = 128)."""
++    return head_size // 4
++
++
++_DECODE_SCRATCH: dict = {}
++
++
++def _decode_scratch(name, shape, dtype, device):
++    """Per-shape persistent scratch for sparse-decode intermediates. Fresh
++    allocations inside the captured decode path come from the CUDA-graph pool
++    and can alias captured memory at batch > 1; reusing a stable per-shape
++    buffer with out=/copy_ keeps the decode path allocation-free."""
++    key = (name, tuple(shape), dtype, device)
++    t = _DECODE_SCRATCH.get(key)
++    if t is None:
++        t = torch.empty(shape, dtype=dtype, device=device)
++        _DECODE_SCRATCH[key] = t
++    return t
++
++
++def _resolve_rank(head_size: int) -> int:
++    """Projection rank r: the ``jssa_rank`` override (e.g. 64 for Gemma 4) or
++    head_size // 4."""
++    cfg = get_current_vllm_config()
++    override = getattr(cfg.attention_config, "jssa_rank", None)
++    return override if override else default_rank(head_size)
++
++
++def fp8_projk_in_separate_cache(fp8_projk: bool, head_size: int) -> bool:
++    """True iff proj_K is NOT stored in the combined slot (FP8 mode, head<=256)."""
++    return fp8_projk and head_size <= 256
++
++
++def _resolve_slot_rank(head_size: int) -> int:
++    """Width of the proj_K region inside the combined slot (0 when proj_K lives
++    in the separate FP8 cache)."""
++    cfg = get_current_vllm_config()
++    if fp8_projk_in_separate_cache(
++        getattr(cfg.attention_config, "jssa_fp8_projk", False), head_size
++    ):
++        return 0
++    return _resolve_rank(head_size)
++
++
++def align_slot_elems(slot_elems: int) -> int:
++    """Pad the combined slot to a 16-byte boundary (8 bf16 elements):
++    flash_attn_varlen_func reads K/V with row stride = slot size and requires
++    16-byte-aligned rows."""
++    return ((slot_elems + 7) // 8) * 8
++
++
++class JSSAAttentionBackend(AttentionBackend):
++    supported_dtypes: ClassVar[list[torch.dtype]] = [torch.float16, torch.bfloat16]
++    # "jssa" routes through JSSAFullAttentionSpec (attention.py) so vLLM's
++    # memory budgeter sizes the cache with the combined slot size.
++    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = ["jssa"]
++    forward_includes_kv_cache_update: bool = False
++
++    @classmethod
++    def supports_kv_cache_dtype(cls, kv_cache_dtype: CacheDType | None) -> bool:
++        return kv_cache_dtype == "jssa"
++
++    @staticmethod
++    def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
++        return [MultipleOf(16)]
++
++    @staticmethod
++    def get_name() -> str:
++        return "JSSA"
++
++    @staticmethod
++    def get_impl_cls() -> type["JSSAImpl"]:
++        return JSSAImpl
++
++    @staticmethod
++    def get_builder_cls() -> type["JSSAMetadataBuilder"]:
++        return JSSAMetadataBuilder
++
++    @staticmethod
++    def get_kv_cache_shape(
++        num_blocks: int,
++        block_size: int,
++        num_kv_heads: int,
++        head_size: int,
++        cache_dtype_str: str = "auto",
++    ) -> tuple[int, ...]:
++        if block_size % 16 != 0:
++            raise ValueError("JSSA: block_size must be a multiple of 16.")
++        slot_size = align_slot_elems(2 * head_size + _resolve_slot_rank(head_size))
++        return (num_blocks, block_size, num_kv_heads, slot_size)
++
++    @classmethod
++    def supports_attn_type(cls, attn_type: str) -> bool:
++        return attn_type == AttentionType.DECODER
++
++    @classmethod
++    def supports_sink(cls) -> bool:
++        from vllm.v1.attention.backends.fa_utils import flash_attn_supports_sinks
++
++        return flash_attn_supports_sinks()
++
++    @classmethod
++    def get_supported_head_sizes(cls) -> list[int]:
++        # 64/128: Llama / Qwen / Mistral family. 256/512: Gemma 4 26B-A4B
++        # (sliding layers head_dim=256, full-attention layers head_dim=512).
++        return [64, 128, 256, 512]
++
++    @classmethod
++    def supports_mm_prefix(cls) -> bool:
++        # Gemma 4 flags its full-attention layers with use_mm_prefix. For text
++        # decoding this reduces to ordinary combined-slot full attention.
++        return True
++
++    @classmethod
++    def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
++        return capability >= DeviceCapability(8, 0)
++
++
++@dataclass
++class JSSAMetadata(AttentionMetadata):
++    num_actual_tokens: int
++    max_query_len: int
++    max_seq_len: int
++    query_start_loc: torch.Tensor
++    seq_lens: torch.Tensor
++    block_table: torch.Tensor
++    slot_mapping: torch.Tensor
++    # With reorder_batch_threshold=1 the scheduler places decode requests
++    # first; the sparse path operates on [:num_decodes].
++    num_decodes: int = 0
++    num_decode_tokens: int = 0
++    query_start_loc_cpu: torch.Tensor | None = None
++    seq_lens_cpu: torch.Tensor | None = None
++    causal: bool = True
++    # Views into the builder's static buffers, sized to this step's decode
++    # batch (None for all-prefill batches).
++    scores_buf: torch.Tensor | None = None
++    top_idx_buf: torch.Tensor | None = None
++    top_scores_buf: torch.Tensor | None = None
++    cu_seqlens_q_dec: torch.Tensor | None = None
++    cu_seqlens_k_dec: torch.Tensor | None = None
++    # Pre-allocated gather output buffers (gather + flash path).
++    K_sel_buf: torch.Tensor | None = None
++    V_sel_buf: torch.Tensor | None = None
++
++
++class JSSAMetadataBuilder(AttentionMetadataBuilder[JSSAMetadata]):
++    # Decode-only CUDA-graph capture. Mixed prefill/decode batches take a
++    # Python-side dense branch and are never captured.
++    _cudagraph_support: ClassVar[AttentionCGSupport] = (
++        AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
++    )
++
++    @classmethod
++    def get_cudagraph_support(
++        cls,
++        vllm_config: VllmConfig,
++        kv_cache_spec: AttentionSpec,
++    ) -> AttentionCGSupport:
++        return cls._cudagraph_support
++
++    def __init__(
++        self,
++        kv_cache_spec: AttentionSpec,
++        layer_names: list[str],
++        vllm_config: VllmConfig,
++        device: torch.device,
++    ):
++        super().__init__(kv_cache_spec, layer_names, vllm_config, device)
++        # Threshold=1: the scheduler reorders so all q_len==1 requests come first.
++        self._init_reorder_batch_threshold(1, supports_spec_as_decode=False)
++
++        self.max_num_reqs = vllm_config.scheduler_config.max_num_seqs
++        self.num_kv_heads = kv_cache_spec.num_kv_heads
++        self.head_size = kv_cache_spec.head_size
++        self.block_size = kv_cache_spec.block_size
++        self._device = device
++        self.n_fac = vllm_config.attention_config.jssa_budget
++
++        # Radix top-k writes int32 indices (torch.topk fallback is copied in).
++        self._top_idx_buf = torch.empty(
++            (self.max_num_reqs, self.num_kv_heads, self.n_fac),
++            dtype=torch.int32,
++            device=device,
++        )
++        self._top_scores_buf = torch.empty(
++            (self.max_num_reqs, self.num_kv_heads, self.n_fac),
++            dtype=torch.float32,
++            device=device,
++        )
++        # Decode cu_seqlens: q = [0, 1, ..., N]; the gathered K/V holds n_fac
++        # rows per request, so k = that arange scaled by n_fac.
++        cu_q = torch.arange(self.max_num_reqs + 1, dtype=torch.int32, device=device)
++        self._cu_seqlens_q_dec = cu_q
++        self._cu_seqlens_k_dec = (cu_q * self.n_fac).to(torch.int32)
++
++        # The scores buffer depends on the runtime block-table width, so it is
++        # sized lazily on the first build() (before CUDA-graph capture).
++        self._scores_buf: torch.Tensor | None = None
++        self._scores_max_kv_len = 0
++
++        # Gather output buffers sized for the worst-case decode batch. These
++        # bypass the shared WorkspaceManager: the post-capture warmup grows that
++        # workspace to a new base address, which would leave captured graphs
++        # pointing at freed memory.
++        kv_dtype = vllm_config.model_config.dtype
++        sel_shape = (
++            self.max_num_reqs * self.n_fac,
++            self.num_kv_heads,
++            self.head_size,
++        )
++        self._K_sel_buf = torch.empty(sel_shape, dtype=kv_dtype, device=device)
++        self._V_sel_buf = torch.empty(sel_shape, dtype=kv_dtype, device=device)
++
++        for buf in (
++            self._top_idx_buf,
++            self._top_scores_buf,
++            self._cu_seqlens_q_dec,
++            self._cu_seqlens_k_dec,
++            self._K_sel_buf,
++            self._V_sel_buf,
++        ):
++            torch._dynamo.mark_static_address(buf)
++
++    def _ensure_scores_buf(self, max_kv_len: int) -> torch.Tensor:
++        """Allocate (or grow) the static scores buffer. The first decode batch is
++        seen during warmup, before capture; afterwards the buffer never moves."""
++        if self._scores_buf is not None and self._scores_max_kv_len >= max_kv_len:
++            return self._scores_buf
++        aligned = ((max_kv_len + 127) // 128) * 128
++        self._scores_buf = torch.empty(
++            (self.max_num_reqs, self.num_kv_heads, aligned),
++            dtype=torch.float32,
++            device=self._device,
++        )
++        self._scores_max_kv_len = aligned
++        torch._dynamo.mark_static_address(self._scores_buf)
++        return self._scores_buf
++
++    def build(
++        self,
++        common_prefix_len: int,
++        common_attn_metadata: CommonAttentionMetadata,
++        fast_build: bool = False,
++    ) -> JSSAMetadata:
++        cam = common_attn_metadata
++        assert self.reorder_batch_threshold is not None
++        num_decodes, _num_prefills, num_decode_tokens, _num_prefill_tokens = (
++            split_decodes_and_prefills(
++                cam, decode_threshold=self.reorder_batch_threshold
++            )
++        )
++
++        if num_decodes > 0:
++            runtime_max_kv_len = cam.block_table_tensor.shape[1] * self.block_size
++            scores_buf = self._ensure_scores_buf(runtime_max_kv_len)[:num_decodes]
++            top_idx_buf = self._top_idx_buf[:num_decodes]
++            top_scores_buf = self._top_scores_buf[:num_decodes]
++            cu_seqlens_q_dec = self._cu_seqlens_q_dec[: num_decodes + 1]
++            cu_seqlens_k_dec = self._cu_seqlens_k_dec[: num_decodes + 1]
++            # jssa_gather slices these to num_decodes * n_fac rows.
++            K_sel_buf = self._K_sel_buf
++            V_sel_buf = self._V_sel_buf
++        else:
++            scores_buf = None
++            top_idx_buf = None
++            top_scores_buf = None
++            cu_seqlens_q_dec = None
++            cu_seqlens_k_dec = None
++            K_sel_buf = None
++            V_sel_buf = None
++
++        return JSSAMetadata(
++            num_actual_tokens=cam.num_actual_tokens,
++            max_query_len=cam.max_query_len,
++            max_seq_len=cam.max_seq_len,
++            query_start_loc=cam.query_start_loc,
++            seq_lens=cam.seq_lens,
++            block_table=cam.block_table_tensor,
++            slot_mapping=cam.slot_mapping,
++            num_decodes=num_decodes,
++            num_decode_tokens=num_decode_tokens,
++            query_start_loc_cpu=cam.query_start_loc_cpu,
++            seq_lens_cpu=cam.seq_lens_cpu_upper_bound,
++            causal=cam.causal,
++            scores_buf=scores_buf,
++            top_idx_buf=top_idx_buf,
++            top_scores_buf=top_scores_buf,
++            cu_seqlens_q_dec=cu_seqlens_q_dec,
++            cu_seqlens_k_dec=cu_seqlens_k_dec,
++            K_sel_buf=K_sel_buf,
++            V_sel_buf=V_sel_buf,
++        )
++
++
++class JSSAImpl(AttentionImpl[JSSAMetadata]):
++    def __init__(
++        self,
++        num_heads: int,
++        head_size: int,
++        scale: float,
++        num_kv_heads: int | None = None,
++        alibi_slopes: list[float] | None = None,
++        sliding_window: int | None = None,
++        kv_cache_dtype: str = "auto",
++        logits_soft_cap: float | None = None,
++        attn_type: str = AttentionType.DECODER,
++        kv_sharing_target_layer_name: str | None = None,
++        **kwargs,
++    ) -> None:
++        self.num_heads = num_heads
++        self.head_size = head_size
++        self.scale = float(scale)
++        self.num_kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
++        self.num_kv_groups = num_heads // self.num_kv_heads
++        self.kv_cache_dtype = kv_cache_dtype
++
++        attn_cfg = get_current_vllm_config().attention_config
++        self._basis_path = attn_cfg.jssa_basis_path
++        self.n_fac = attn_cfg.jssa_budget
++        self.cs_h = _resolve_rank(head_size)
++        self.slot_size = align_slot_elems(2 * head_size + _resolve_slot_rank(head_size))
++        # FP8 projected-key cache: stored in a separate contiguous
++        # [num_blocks, block_size, H_kv, r] e4m3 cache (also for head 512,
++        # where the slot still carries an unused bf16 proj_K region).
++        self.fp8_projk = bool(getattr(attn_cfg, "jssa_fp8_projk", False)) and (
++            head_size <= 512
++        )
++        # Gather-free indexed attention (fused selection-gather + attend). The
++        # decode-time gate below falls back to gather + flash for sinks,
++        # softcap, alibi, a non-power-of-2 GQA group, or the eager
++        # seq_len < B tail.
++        self.indexed_attend = bool(getattr(attn_cfg, "jssa_indexed_attend", True))
++        self.indexed_min_batch = int(getattr(attn_cfg, "jssa_indexed_min_batch", 1) or 1)
++        self._sm_count = (
++            torch.cuda.get_device_properties(0).multi_processor_count
++            if torch.cuda.is_available()
++            else 132
++        )
++        self._projk_cache: torch.Tensor | None = None  # lazy: needs num_blocks
++        self._projk_scale: torch.Tensor | None = None  # [H_kv, r] fp8 scale
++        self._M_dict_cpu: dict[int, torch.Tensor] | None = None  # lazy load
++        if alibi_slopes is not None:
++            alibi_slopes = torch.tensor(alibi_slopes, dtype=torch.float32)
++        self.alibi_slopes = alibi_slopes
++        if sliding_window is None:
++            self.sliding_window = (-1, -1)
++        else:
++            self.sliding_window = (sliding_window - 1, 0)
++        self.logits_soft_cap = 0 if logits_soft_cap is None else logits_soft_cap
++        self.attn_type = attn_type
++        self.kv_sharing_target_layer_name = kv_sharing_target_layer_name
++        # Learned attention sinks (softmax([qk; sink])); None for most models.
++        self.sinks = kwargs.get("sinks")
++        from vllm.v1.attention.backends.fa_utils import get_flash_attn_version
++        from vllm.vllm_flash_attn.flash_attn_interface import DEFAULT_FA_VERSION
++
++        if self.sinks is not None:
++            assert self.sinks.shape[0] == num_heads, (
++                f"sinks {tuple(self.sinks.shape)} vs num_heads {num_heads}"
++            )
++            self._fa_version = get_flash_attn_version(has_sinks=True)
++        else:
++            self._fa_version = DEFAULT_FA_VERSION
++
++    def _ensure_on_device(
++        self, layer: torch.nn.Module, device: torch.device, dtype: torch.dtype
++    ) -> torch.Tensor | None:
++        """Lazily load this layer's basis M [H_kv, r, head_size] (cached on the
++        layer). Returns None for layers absent from the basis file, which then
++        run dense attention (e.g. the sliding-window layers of Gemma 4)."""
++        cached = getattr(layer, "_jssa_M", None)
++        if cached is not None:
++            return cached
++        if getattr(layer, "_jssa_dense", False):
++            return None
++
++        if self._basis_path is None:
++            raise RuntimeError(
++                "JSSA backend requires attention_config.jssa_basis_path "
++                "(a calibration .pt file {'M': {layer_idx: Tensor[H_kv, r, d]}})."
++            )
++
++        if self._M_dict_cpu is None:
++            ckpt = torch.load(self._basis_path, map_location="cpu", weights_only=False)
++            self._M_dict_cpu = ckpt["M"] if isinstance(ckpt, dict) and "M" in ckpt else ckpt
++            if not isinstance(self._M_dict_cpu, dict):
++                raise RuntimeError(
++                    f"JSSA basis at {self._basis_path} does not contain a "
++                    "{layer_idx: tensor} dict at key 'M'."
++                )
++
++        from vllm.model_executor.models.utils import extract_layer_index
++
++        layer_idx = extract_layer_index(layer.layer_name)
++        M_cpu = self._M_dict_cpu.get(layer_idx)
++        if M_cpu is None:
++            layer._jssa_dense = True
++            return None
++
++        # Tensor parallel: the basis covers ALL kv heads; vLLM shards kv heads
++        # as contiguous slices per rank, so take this rank's slice.
++        from vllm.distributed import (
++            get_tensor_model_parallel_rank,
++            get_tensor_model_parallel_world_size,
++        )
++
++        tp_size = get_tensor_model_parallel_world_size()
++        if tp_size > 1 and M_cpu.shape[0] == self.num_kv_heads * tp_size:
++            tp_rank = get_tensor_model_parallel_rank()
++            M_cpu = M_cpu[tp_rank * self.num_kv_heads : (tp_rank + 1) * self.num_kv_heads]
++        expected_shape = (self.num_kv_heads, self.cs_h, self.head_size)
++        if tuple(M_cpu.shape) != expected_shape:
++            raise RuntimeError(
++                f"JSSA basis M[{layer_idx}] shape {tuple(M_cpu.shape)} != "
++                f"expected {expected_shape} (H_kv={self.num_kv_heads}, "
++                f"r={self.cs_h}, d={self.head_size})."
++            )
++
++        M = M_cpu.to(device=device, dtype=dtype).contiguous()
++        # Layer-static: a stable address lets the captured decode graph keep it.
++        torch._dynamo.mark_static_address(M)
++        layer._jssa_M = M
++        if self.fp8_projk and self._projk_scale is None:
++            # Per-(head, channel) fp8 scale = row norm of M, folded into proj_q
++            # at decode so the score recovers proj_q . proj_K up to fp8 rounding.
++            scale = M.float().norm(dim=2).clamp_min(1e-6).to(dtype).contiguous()
++            torch._dynamo.mark_static_address(scale)
++            self._projk_scale = scale  # [H_kv, r]
++        return M
++
++    def _dense_varlen(self, query, key_cache, value_cache, output, attn_metadata,
++                      q_slice, req_slice, cu_seqlens_q):
++        """Dense paged attention for prefill rows (unified Triton attention for
++        head_size > 256, FlashAttention otherwise)."""
++        if self.head_size > 256:
++            unified_attention(
++                q=query[q_slice],
++                k=key_cache,
++                v=value_cache,
++                out=output[q_slice],
++                cu_seqlens_q=cu_seqlens_q,
++                max_seqlen_q=attn_metadata.max_query_len,
++                seqused_k=attn_metadata.seq_lens[req_slice],
++                max_seqlen_k=attn_metadata.max_seq_len,
++                softmax_scale=self.scale,
++                causal=True,
++                window_size=self.sliding_window,
++                block_table=attn_metadata.block_table[req_slice],
++                softcap=self.logits_soft_cap,
++                q_descale=None,
++                k_descale=None,
++                v_descale=None,
++                alibi_slopes=self.alibi_slopes,
++            )
++            return
++        flash_attn_varlen_func(
++            q=query[q_slice],
++            k=key_cache,
++            v=value_cache,
++            out=output[q_slice],
++            cu_seqlens_q=cu_seqlens_q,
++            max_seqlen_q=attn_metadata.max_query_len,
++            seqused_k=attn_metadata.seq_lens[req_slice],
++            max_seqlen_k=attn_metadata.max_seq_len,
++            softmax_scale=self.scale,
++            causal=attn_metadata.causal,
++            alibi_slopes=self.alibi_slopes,
++            window_size=list(self.sliding_window),
++            block_table=attn_metadata.block_table[req_slice],
++            softcap=self.logits_soft_cap,
++            s_aux=self.sinks,
++            fa_version=self._fa_version,
++        )
++
++    def forward(
++        self,
++        layer: torch.nn.Module,
++        query: torch.Tensor,
++        key: torch.Tensor,
++        value: torch.Tensor,
++        kv_cache: torch.Tensor,
++        attn_metadata: JSSAMetadata,
++        output: torch.Tensor,
++        output_scale: torch.Tensor | None = None,
++        output_block_scale: torch.Tensor | None = None,
++    ) -> torch.Tensor:
++        if output_scale is not None or output_block_scale is not None:
++            raise NotImplementedError("JSSA: fused output quantization is not supported.")
++        if attn_metadata is None:
++            # Profiling run.
++            return output.fill_(0)
++
++        head_size = self.head_size
++        num_actual_tokens = attn_metadata.num_actual_tokens
++        num_decodes = attn_metadata.num_decodes
++        num_decode_tokens = attn_metadata.num_decode_tokens
++
++        # K = slot[:d], V = slot[d:2d] (strided views; the attention kernels
++        # are stride-aware).
++        key_cache = kv_cache[..., :head_size]
++        value_cache = kv_cache[..., head_size : 2 * head_size]
++
++        M = self._ensure_on_device(layer, query.device, query.dtype)
++        if M is None:
++            # Layer without a basis: plain paged attention with its own window.
++            flash_attn_varlen_func(
++                q=query[:num_actual_tokens],
++                k=key_cache,
++                v=value_cache,
++                out=output[:num_actual_tokens],
++                cu_seqlens_q=attn_metadata.query_start_loc,
++                max_seqlen_q=attn_metadata.max_query_len,
++                seqused_k=attn_metadata.seq_lens,
++                max_seqlen_k=attn_metadata.max_seq_len,
++                softmax_scale=self.scale,
++                causal=attn_metadata.causal,
++                alibi_slopes=self.alibi_slopes,
++                window_size=list(self.sliding_window),
++                block_table=attn_metadata.block_table,
++                softcap=self.logits_soft_cap,
++                s_aux=self.sinks,
++                fa_version=self._fa_version,
++            )
++            return output
++
++        if num_decodes == 0:
++            # All-prefill batch: dense attention.
++            self._dense_varlen(
++                query, key_cache, value_cache, output, attn_metadata,
++                q_slice=slice(0, num_actual_tokens), req_slice=slice(None),
++                cu_seqlens_q=attn_metadata.query_start_loc,
++            )
++            return output
++
++        # Sparse decode for the first num_decodes requests (the all-decode case
++        # is the CUDA-graph-captured path).
++        self._sparse_decode_forward(query, kv_cache, attn_metadata, output, M)
++
++        if num_decode_tokens < num_actual_tokens:
++            # Mixed batch: dense attention for the trailing prefill rows.
++            self._dense_varlen(
++                query, key_cache, value_cache, output, attn_metadata,
++                q_slice=slice(num_decode_tokens, num_actual_tokens),
++                req_slice=slice(num_decodes, None),
++                cu_seqlens_q=attn_metadata.query_start_loc[num_decodes:]
++                - num_decode_tokens,
++            )
++        return output
++
++    def _sparse_decode_forward(
++        self,
++        query: torch.Tensor,
++        kv_cache: torch.Tensor,
++        attn_metadata: JSSAMetadata,
++        output: torch.Tensor,
++        M: torch.Tensor,
++    ) -> None:
++        """Group-mean q -> proj_q -> score + top-B -> exact attention on B tokens."""
++        head_size = self.head_size
++        num_decodes = attn_metadata.num_decodes
++        num_decode_tokens = attn_metadata.num_decode_tokens
++        # supports_spec_as_decode=False guarantees one token per decode request.
++        assert num_decode_tokens == num_decodes, (
++            "JSSA sparse decode assumes q_len=1 per decode request "
++            f"(num_decode_tokens={num_decode_tokens}, num_decodes={num_decodes})"
++        )
++        q_decode = query[:num_decode_tokens]  # (num_decodes, H_q, head_size)
++
++        if self.sliding_window != (-1, -1):
++            # Sliding-window layer that carries a basis: no selection, dense
++            # windowed attention (the selected set would ignore the window).
++            flash_attn_varlen_func(
++                q=q_decode,
++                k=kv_cache[..., :head_size],
++                v=kv_cache[..., head_size : 2 * head_size],
++                out=output[:num_decode_tokens],
++                cu_seqlens_q=attn_metadata.cu_seqlens_q_dec,
++                max_seqlen_q=1,
++                seqused_k=attn_metadata.seq_lens[:num_decodes],
++                max_seqlen_k=attn_metadata.max_seq_len,
++                softmax_scale=self.scale,
++                causal=True,
++                window_size=list(self.sliding_window),
++                block_table=attn_metadata.block_table[:num_decodes],
++                softcap=self.logits_soft_cap,
++                s_aux=self.sinks,
++                fa_version=self._fa_version,
++            )
++            return
++
++        # 1. GQA group mean: H_q -> H_kv (query head h belongs to kv head h // G).
++        q_kv = _decode_scratch(
++            "qkv", (num_decodes, self.num_kv_heads, head_size),
++            q_decode.dtype, q_decode.device,
++        )
++        torch.mean(
++            q_decode.view(num_decodes, self.num_kv_heads, self.num_kv_groups, head_size),
++            dim=2,
++            out=q_kv,
++        )
++
++        # 2. proj_q[r, h, c] = sum_d q_kv[r, h, d] * M[h, c, d]  (per-kv-head bmm).
++        projq_hrc = _decode_scratch(
++            "projq", (self.num_kv_heads, num_decodes, self.cs_h),
++            q_kv.dtype, q_kv.device,
++        )
++        torch.bmm(q_kv.transpose(0, 1), M.transpose(1, 2), out=projq_hrc)
++        if self.fp8_projk:
++            # Fold the fp8 scale into proj_q (in place, allocation-free).
++            projq_hrc.mul_(self._projk_scale.unsqueeze(1))  # [H_kv, 1, r]
++        proj_q = projq_hrc.transpose(0, 1)  # (num_decodes, H_kv, r) view
++
++        # 3-4. Score every cached token, radix top-B per (request, kv head).
++        block_table_dec = attn_metadata.block_table[:num_decodes]
++        seq_lens_dec = attn_metadata.seq_lens[:num_decodes]
++        top_idx, _ = jssa_score_topk(
++            proj_q,
++            kv_cache,
++            block_table_dec,
++            seq_lens_dec,
++            n_fac=self.n_fac,
++            head_size=head_size,
++            cs_h=self.cs_h,
++            scores_out=attn_metadata.scores_buf,
++            top_idx_out=attn_metadata.top_idx_buf,
++            top_scores_out=attn_metadata.top_scores_buf,
++            use_radix=True,
++            projk_cache=self._projk_cache,
++        )  # (num_decodes, H_kv, n_fac_eff) int32
++
++        n_fac_eff = top_idx.shape[-1]
++        # seq_len < B: the radix pad cycles real tokens into the unused slots.
++        # In eager mode, compact valid selections to the front and attend only
++        # min(seq_len, B) rows, which is exact dense attention over the real
++        # tokens. (Under CUDA-graph capture the host check is skipped; the
++        # cycled duplicates are near-exact since equal multiplicity cancels.)
++        partial = False
++        if not torch.cuda.is_current_stream_capturing():
++            partial = bool((seq_lens_dec < n_fac_eff).any().item())
++        if partial:
++            invalid = top_idx.long() >= seq_lens_dec.view(num_decodes, 1, 1)
++            order = torch.argsort(invalid.to(torch.uint8), dim=-1, stable=True)
++            top_idx = torch.gather(top_idx, -1, order)
++
++        # 5a. Gather-free indexed attention.
++        if (
++            self.indexed_attend
++            and num_decodes >= self.indexed_min_batch
++            and head_size <= 512
++            and not partial
++            and self.sinks is None
++            and not self.logits_soft_cap
++            and self.alibi_slopes is None
++            # the kernel does tl.arange over the GQA group (power of 2 only;
++            # Qwen3-14B has G = 5 and falls back to gather + flash).
++            and (self.num_kv_groups & (self.num_kv_groups - 1)) == 0
++        ):
++            from vllm.v1.attention.ops.triton_jssa_indexed_attend import (
++                jssa_indexed_attend,
++            )
++
++            jssa_indexed_attend(
++                q_decode, kv_cache, block_table_dec, top_idx,
++                head_size=head_size, scale=self.scale,
++                out=output[:num_decode_tokens],
++                scratch=_decode_scratch, sm_count=self._sm_count,
++            )
++            return
++
++        # 5b. Gather + attend.
++        K_sel, V_sel = jssa_gather(
++            kv_cache,
++            block_table_dec,
++            top_idx,
++            head_size=head_size,
++            dtype=q_decode.dtype,
++            K_sel_out=attn_metadata.K_sel_buf,
++            V_sel_out=attn_metadata.V_sel_buf,
++        )  # (num_decodes * n_fac_eff, H_kv, head_size)
++
++        cu_seqlens_q = attn_metadata.cu_seqlens_q_dec
++        if n_fac_eff == self.n_fac:
++            cu_seqlens_k = attn_metadata.cu_seqlens_k_dec
++        else:
++            cu_seqlens_k = cu_seqlens_q * n_fac_eff
++
++        if head_size > 256:
++            # FlashAttention caps head_dim at 256 (Gemma 4 full layers are 512):
++            # the selected set is small, so a manual GQA attention is cheap.
++            nd = num_decodes
++            nf = n_fac_eff
++            Hkv = self.num_kv_heads
++            G = self.num_kv_groups
++            d = head_size
++            K = K_sel.view(nd, nf, Hkv, d).permute(0, 2, 1, 3)  # (nd, Hkv, nf, d)
++            V = V_sel.view(nd, nf, Hkv, d).permute(0, 2, 1, 3)
++            q = q_decode.view(nd, Hkv, G, d).to(torch.float32)
++            scores = torch.einsum("nhgd,nhfd->nhgf", q, K.to(torch.float32))
++            scores = scores * self.scale
++            if partial:
++                tail = (
++                    torch.arange(nf, device=scores.device).view(1, 1, 1, nf)
++                    >= seq_lens_dec.view(nd, 1, 1, 1)
++                )
++                scores = scores.masked_fill(tail, float("-inf"))
++            attn = torch.softmax(scores, dim=-1)
++            out = torch.einsum("nhgf,nhfd->nhgd", attn, V.to(torch.float32))
++            output[:num_decode_tokens] = out.reshape(nd, Hkv * G, d).to(output.dtype)
++            return
++
++        if partial:
++            # Attend only the first min(seq_len, B) gathered rows per request.
++            # cu_seqlens_k and seqused_k are mutually exclusive, so present
++            # K_sel as a paged cache with one n_fac_eff-sized page per request.
++            flash_attn_varlen_func(
++                q=q_decode,
++                k=K_sel.view(num_decodes, n_fac_eff, self.num_kv_heads, head_size),
++                v=V_sel.view(num_decodes, n_fac_eff, self.num_kv_heads, head_size),
++                out=output[:num_decode_tokens],
++                cu_seqlens_q=cu_seqlens_q,
++                max_seqlen_q=1,
++                seqused_k=seq_lens_dec.to(torch.int32).clamp(max=n_fac_eff),
++                max_seqlen_k=n_fac_eff,
++                block_table=torch.arange(
++                    num_decodes, dtype=torch.int32, device=q_decode.device
++                ).view(num_decodes, 1),
++                softmax_scale=self.scale,
++                causal=False,  # the selected tokens are a set, not a sequence
++                alibi_slopes=self.alibi_slopes,
++                softcap=self.logits_soft_cap,
++                s_aux=self.sinks,
++                fa_version=self._fa_version,
++            )
++            return
++        flash_attn_varlen_func(
++            q=q_decode,
++            k=K_sel,
++            v=V_sel,
++            out=output[:num_decode_tokens],
++            cu_seqlens_q=cu_seqlens_q,
++            max_seqlen_q=1,
++            cu_seqlens_k=cu_seqlens_k,
++            max_seqlen_k=n_fac_eff,
++            softmax_scale=self.scale,
++            causal=False,  # the selected tokens are a set, not a sequence
++            alibi_slopes=self.alibi_slopes,
++            softcap=self.logits_soft_cap,
++            s_aux=self.sinks,
++            fa_version=self._fa_version,
++        )
++
++    def _ensure_projk_cache(
++        self, kv_cache: torch.Tensor, device: torch.device
++    ) -> torch.Tensor:
++        """Lazily allocate the FP8 projected-key cache with this layer's block
++        count. Re-sized if the block count changes: warmup passes may run on a
++        small placeholder cache before the real KV cache exists. The final
++        allocation happens in the eager warmup, before CUDA-graph capture.
++
++        NOTE: this cache (r bytes per token and KV head) is allocated outside
++        vLLM's KV-cache memory budget."""
++        num_blocks, block_size = kv_cache.shape[0], kv_cache.shape[1]
++        if self._projk_cache is None or self._projk_cache.shape[0] != num_blocks:
++            self._projk_cache = torch.zeros(
++                num_blocks, block_size, self.num_kv_heads, self.cs_h,
++                dtype=torch.float8_e4m3fn, device=device,
++            )
++            try:
++                torch._dynamo.mark_static_address(self._projk_cache)
++            except Exception:
++                pass
++        return self._projk_cache
++
++    def do_kv_cache_update(
++        self,
++        layer: torch.nn.Module,
++        key: torch.Tensor,
++        value: torch.Tensor,
++        kv_cache: torch.Tensor,
++        slot_mapping: torch.Tensor,
++    ) -> None:
++        # Fused write of K, V, and proj_K = M @ K.
++        M = self._ensure_on_device(layer, key.device, key.dtype)
++        if M is None:
++            jssa_store(key, value, kv_cache, slot_mapping)
++        elif self.fp8_projk:
++            pk = self._ensure_projk_cache(kv_cache, key.device)
++            jssa_project_and_store_contig_fp8(
++                key, value, kv_cache, pk, self._projk_scale, slot_mapping, M
++            )
++        else:
++            jssa_project_and_store(key, value, kv_cache, slot_mapping, M)
+diff --git a/vllm/v1/attention/backends/mla/flashmla_sparse.py b/vllm/v1/attention/backends/mla/flashmla_sparse.py
+index 797179076..8fb3c98e7 100644
+--- a/vllm/v1/attention/backends/mla/flashmla_sparse.py
++++ b/vllm/v1/attention/backends/mla/flashmla_sparse.py
+@@ -295,7 +295,13 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
+             FlashMLASparseImpl._compute_fp8_decode_padded_heads(self.num_heads)
+         )
+ 
+-        self.topk_tokens = vllm_config.model_config.hf_config.index_topk
++        # With JSSA the selection budget is jssa_budget (the JSSA indexer writes
++        # that many indices); otherwise the model's native DSA index_topk.
++        _ac = vllm_config.attention_config
++        if getattr(_ac, "jssa_mla", False):
++            self.topk_tokens = _ac.jssa_budget
++        else:
++            self.topk_tokens = vllm_config.model_config.hf_config.index_topk
+         self.use_fp8_kv_cache = cache_config.cache_dtype == "fp8_ds_mla"
+         max_num_seqs = vllm_config.scheduler_config.max_num_seqs
+         # Shape: [max_num_seqs], all elements = topk_tokens (constant for full-CG)
+@@ -994,12 +1000,15 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
+         # NOTE(Chen): kernel requires num_local_head to be a multiple of
+         # 64 on hopper and 128 on blackwell
+         if self.num_heads % self.prefill_padding != 0:
+-            assert self.prefill_padding % self.num_heads == 0
+             logger.warning_once(
+                 f"Padding num_heads from {self.num_heads} to "
+                 f"{self.prefill_padding} for BF16 sparse prefill kernel"
+             )
+-            q_padded = q.new_empty((q.shape[0], self.prefill_padding, q.shape[2]))
++            # Zero-pad (NOT new_empty): garbage q rows can produce inf/NaN in
++            # the padded heads. Padded head outputs are sliced off below, but
++            # zeros keep them finite. Non-divisible head counts (e.g. GLM
++            # H=20 -> 128) are fine: extra rows are dead weight only.
++            q_padded = q.new_zeros((q.shape[0], self.prefill_padding, q.shape[2]))
+             q_padded[:, : self.num_heads, :] = q
+             q = q_padded
+ 
+diff --git a/vllm/v1/attention/backends/registry.py b/vllm/v1/attention/backends/registry.py
+index 87abb6884..5fc4de640 100644
+--- a/vllm/v1/attention/backends/registry.py
++++ b/vllm/v1/attention/backends/registry.py
+@@ -85,6 +85,7 @@ class AttentionBackendEnum(Enum, metaclass=_AttentionBackendEnumMeta):
+     )
+     CPU_ATTN = "vllm.v1.attention.backends.cpu_attn.CPUAttentionBackend"
+     TURBOQUANT = "vllm.v1.attention.backends.turboquant_attn.TurboQuantAttentionBackend"
++    JSSA = "vllm.v1.attention.backends.jssa_attn.JSSAAttentionBackend"
+     # Placeholder for third-party/custom backends - must be registered before use
+     # set to None to avoid alias with other backend, whose value is an empty string
+     CUSTOM = None
+diff --git a/vllm/v1/attention/ops/triton_jssa_gather.py b/vllm/v1/attention/ops/triton_jssa_gather.py
+new file mode 100644
+index 000000000..2872459c1
+--- /dev/null
++++ b/vllm/v1/attention/ops/triton_jssa_gather.py
+@@ -0,0 +1,175 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""JSSA paged -> contiguous K/V gather (the gather + attend decode path).
++
++Given top-B token indices per (request, KV head) -- each KV head selects its own
++positions -- gather the corresponding K and V rows out of the paged combined-slot
++cache into varlen-flat buffers that ``flash_attn_varlen_func`` consumes directly.
++
++Output layout:
++    K_sel[r * n_fac + i, h, :] = kv_cache[block_id, pos, h, 0 : head_size]
++    V_sel[r * n_fac + i, h, :] = kv_cache[block_id, pos, h, head_size : 2*head_size]
++where (block_id, pos) is decoded from top_idx[r, h, i] via block_table[r].
++
++The backend passes pre-allocated output buffers; ``WorkspaceManager`` and plain
++allocation are fallbacks for tests.
++"""
++
++import torch
++
++from vllm.triton_utils import tl, triton
++from vllm.v1.worker.workspace import (
++    current_workspace_manager,
++    is_workspace_manager_initialized,
++)
++
++
++@triton.jit
++def _jssa_gather_kernel(
++    kv_cache_ptr,  # [num_blocks, block_size, H_kv, slot_size]
++    block_table_ptr,  # [num_reqs, max_blocks]
++    top_idx_ptr,  # [num_reqs, H_kv, n_fac]  int32 or int64
++    K_sel_ptr,  # [num_reqs * n_fac, H_kv, head_size]
++    V_sel_ptr,  # [num_reqs * n_fac, H_kv, head_size]
++    n_fac,
++    head_size,
++    block_size,
++    cache_stride_block,
++    cache_stride_pos,
++    cache_stride_head,
++    bt_stride_r,
++    top_stride_r,
++    top_stride_h,
++    ksel_stride_t,
++    ksel_stride_h,
++    vsel_stride_t,
++    vsel_stride_h,
++    BLOCK_N: tl.constexpr,
++    BLOCK_D: tl.constexpr,
++):
++    # One program copies a TILE of BLOCK_N selected tokens for one (req, kv-head)
++    # as a 2D [BLOCK_N, BLOCK_D] load/store. The old kernel launched one program
++    # per (req, head, token) — n_fac× more tiny blocks — and was launch/occupancy
++    # bound (a contiguous-index gather ran at the same speed as a scattered one,
++    # i.e. the access pattern wasn't the limiter, the block count was). Tiling
++    # cuts the grid by BLOCK_N× and vectorizes the copy.
++    pid_r = tl.program_id(0)
++    pid_h = tl.program_id(1)
++    pid_n = tl.program_id(2)  # tile of BLOCK_N tokens within n_fac
++
++    i_offs = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)  # [BLOCK_N]
++    i_mask = i_offs < n_fac
++
++    t = tl.load(
++        top_idx_ptr + pid_r * top_stride_r + pid_h * top_stride_h + i_offs,
++        mask=i_mask, other=0,
++    )
++    block_idx_in_table = t // block_size
++    pos_in_block = t % block_size
++    # int64: physical block ids overflow int32 cache-offset arithmetic once the
++    # KV cache fills large memory -> intermittent OOB gather at long context.
++    block_id = tl.load(
++        block_table_ptr + pid_r * bt_stride_r + block_idx_in_table,
++        mask=i_mask, other=0,
++    ).to(tl.int64)
++
++    d_offs = tl.arange(0, BLOCK_D)
++    d_mask = d_offs < head_size
++    m = i_mask[:, None] & d_mask[None, :]
++    # Per-token slot base (K region); V is +head_size within the same slot.
++    src_base = (
++        block_id * cache_stride_block
++        + pos_in_block * cache_stride_pos
++        + pid_h * cache_stride_head
++    )  # [BLOCK_N]
++    src = kv_cache_ptr + src_base[:, None] + d_offs[None, :]  # [BLOCK_N, BLOCK_D]
++    K = tl.load(src, mask=m, other=0.0)
++    V = tl.load(src + head_size, mask=m, other=0.0)
++
++    out_row = pid_r * n_fac + i_offs  # [BLOCK_N]
++    dst_K = (
++        K_sel_ptr + out_row[:, None] * ksel_stride_t
++        + pid_h * ksel_stride_h + d_offs[None, :]
++    )
++    dst_V = (
++        V_sel_ptr + out_row[:, None] * vsel_stride_t
++        + pid_h * vsel_stride_h + d_offs[None, :]
++    )
++    tl.store(dst_K, K, mask=m)
++    tl.store(dst_V, V, mask=m)
++
++
++def jssa_gather(
++    kv_cache: torch.Tensor,  # (num_blocks, block_size, H_kv, slot_size)
++    block_table: torch.Tensor,  # (num_reqs, max_blocks) int32
++    top_idx: torch.Tensor,  # (num_reqs, H_kv, n_fac) int32 or int64
++    head_size: int,
++    dtype: torch.dtype | None = None,
++    K_sel_out: torch.Tensor | None = None,
++    V_sel_out: torch.Tensor | None = None,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """Gather K and V slices for selected positions into varlen-flat buffers.
++
++    Returns (K_sel, V_sel) each shaped (num_reqs * n_fac, H_kv, head_size).
++
++    Buffer source priority:
++      1. Caller-provided ``K_sel_out`` / ``V_sel_out`` (preferred for CG
++         capture — see the docstring on
++         ``JSSAMetadataBuilder._K_sel_buf`` for why we can't use the
++         shared ``WorkspaceManager`` on this path).
++      2. ``WorkspaceManager`` if initialized.
++      3. Plain ``torch.empty`` fallback.
++    """
++    num_reqs, H_kv, n_fac = top_idx.shape
++    if dtype is None:
++        dtype = kv_cache.dtype
++
++    flat_len = num_reqs * n_fac
++    shape = (flat_len, H_kv, head_size)
++
++    if K_sel_out is not None and V_sel_out is not None:
++        # Caller owns the buffers (JSSA backend path). Slice to this
++        # step's flat_len. The caller pre-allocated for the engine's
++        # ``max_num_reqs * n_fac``, so the slice always fits.
++        assert K_sel_out.shape[0] >= flat_len and V_sel_out.shape[0] >= flat_len
++        assert K_sel_out.dtype == dtype and V_sel_out.dtype == dtype
++        K_sel = K_sel_out[:flat_len]
++        V_sel = V_sel_out[:flat_len]
++    elif is_workspace_manager_initialized():
++        K_sel, V_sel = current_workspace_manager().get_simultaneous(
++            (shape, dtype),
++            (shape, dtype),
++        )
++    else:
++        device = kv_cache.device
++        K_sel = torch.empty(shape, dtype=dtype, device=device)
++        V_sel = torch.empty(shape, dtype=dtype, device=device)
++
++    BLOCK_D = triton.next_power_of_2(head_size)
++    BLOCK_N = 16  # tokens copied per program (grid shrinks by this factor)
++    block_size = kv_cache.shape[1]
++    grid = (num_reqs, H_kv, triton.cdiv(n_fac, BLOCK_N))
++
++    _jssa_gather_kernel[grid](
++        kv_cache,
++        block_table,
++        top_idx,
++        K_sel,
++        V_sel,
++        n_fac,
++        head_size,
++        block_size,
++        kv_cache.stride(0),
++        kv_cache.stride(1),
++        kv_cache.stride(2),
++        block_table.stride(0),
++        top_idx.stride(0),
++        top_idx.stride(1),
++        K_sel.stride(0),
++        K_sel.stride(1),
++        V_sel.stride(0),
++        V_sel.stride(1),
++        BLOCK_N=BLOCK_N,
++        BLOCK_D=BLOCK_D,
++    )
++    return K_sel, V_sel
+diff --git a/vllm/v1/attention/ops/triton_jssa_indexed_attend.py b/vllm/v1/attention/ops/triton_jssa_indexed_attend.py
+new file mode 100644
+index 000000000..61c6acd47
+--- /dev/null
++++ b/vllm/v1/attention/ops/triton_jssa_indexed_attend.py
+@@ -0,0 +1,242 @@
++"""Gather-free indexed attention for JSSA decode.
++
++The gather + attend path materializes the selected K/V into a contiguous
++[num_decodes * n_fac, H_kv, head_size] buffer and runs a dense
++``flash_attn_varlen_func`` over it; that buffer scales with num_decodes * n_fac.
++This kernel fuses selection-gather and attention instead: the n_fac selected
++tokens of each KV head are streamed straight out of the paged cache via
++``top_idx`` (online softmax, ``tl.dot`` for QK/PV), so no intermediate buffer
++exists. Each program handles the whole GQA group of a KV head, so K/V are read
++once per KV head. Only K|V are read from the slot.
++
++Two grids:
++  - single pass (``_indexed_attend_kv_kernel``): one program per
++    (request, KV head); used once num_decodes * H_kv fills the SMs.
++  - split-N (``_split_attend_kernel`` + ``_split_reduce_kernel``): splits the
++    n_fac scan over S programs plus an online-softmax reduce, keeping the GPU
++    occupied at small batch. S is chosen from the SM count.
++
++Caller gates (jssa_attn.py): head_size <= 512 (BLOCK_N shrinks to 32 for 512 to
++fit shared memory), set attention, no sinks/softcap/alibi, power-of-2 GQA group,
++steady-state (seq_len >= B). Slot addressing is int64.
++"""
++
++import torch
++import triton
++import triton.language as tl
++
++
++@triton.jit
++def _indexed_attend_kv_kernel(
++    q_ptr, kv_cache_ptr, block_table_ptr, top_idx_ptr, o_ptr,
++    scale, n_fac, hs, block_size,
++    q_sr, q_sh, kv_sb, kv_sp, kv_sh, bt_sr, top_sr, top_sh, o_sr, o_sh,
++    G: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_D: tl.constexpr,
++):
++    # one program per (request, kv_head): the whole group of G q-heads sharing
++    # this kv-head is processed together so K,V are read ONCE per kv-head.
++    pid_r = tl.program_id(0)
++    pid_hk = tl.program_id(1)
++    d = tl.arange(0, BLOCK_D)
++    dm = d < hs
++    g = tl.arange(0, G)
++    qh = pid_hk * G + g
++    q = tl.load(q_ptr + pid_r * q_sr + qh[:, None] * q_sh + d[None, :],
++                mask=dm[None, :], other=0.0).to(tl.float32)
++    m_i = tl.full([G], -float("inf"), tl.float32)
++    l_i = tl.zeros([G], tl.float32)
++    acc = tl.zeros([G, BLOCK_D], tl.float32)
++    for start in range(0, n_fac, BLOCK_N):
++        n = start + tl.arange(0, BLOCK_N)
++        nm = n < n_fac
++        tok = tl.load(top_idx_ptr + pid_r * top_sr + pid_hk * top_sh + n,
++                      mask=nm, other=0)
++        blk = tl.load(block_table_ptr + pid_r * bt_sr + (tok // block_size),
++                      mask=nm, other=0)
++        base = (blk.to(tl.int64) * kv_sb.to(tl.int64)
++                + (tok % block_size).to(tl.int64) * kv_sp.to(tl.int64)
++                + pid_hk.to(tl.int64) * kv_sh.to(tl.int64))
++        k = tl.load(kv_cache_ptr + base[:, None] + d[None, :],
++                    mask=nm[:, None] & dm[None, :], other=0.0).to(tl.float32)
++        v = tl.load(kv_cache_ptr + base[:, None] + (hs + d[None, :]),
++                    mask=nm[:, None] & dm[None, :], other=0.0).to(tl.float32)
++        s = tl.dot(q, tl.trans(k)) * scale
++        s = tl.where(nm[None, :], s, -float("inf"))
++        m_new = tl.maximum(m_i, tl.max(s, axis=1))
++        alpha = tl.exp(m_i - m_new)
++        p = tl.exp(s - m_new[:, None])
++        l_i = l_i * alpha + tl.sum(p, axis=1)
++        acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
++        m_i = m_new
++    o = acc / l_i[:, None]
++    tl.store(o_ptr + pid_r * o_sr + qh[:, None] * o_sh + d[None, :],
++             o.to(o_ptr.dtype.element_ty), mask=dm[None, :])
++
++
++@triton.jit
++def _split_attend_kernel(
++    q_ptr, kv_cache_ptr, block_table_ptr, top_idx_ptr,
++    m_ptr, l_ptr, acc_ptr,
++    scale, n_fac, hs, block_size, S,
++    q_sr, q_sh, kv_sb, kv_sp, kv_sh, bt_sr, top_sr, top_sh,
++    m_sr, m_sh, m_ss, a_sr, a_sh, a_ss,
++    G: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_D: tl.constexpr,
++):
++    # grid (num_decodes, H_kv, S): this program owns split pid_s of the n_fac
++    # scan for (request pid_r, kv-head pid_hk), producing a partial (m,l,acc).
++    pid_r = tl.program_id(0)
++    pid_hk = tl.program_id(1)
++    pid_s = tl.program_id(2)
++    d = tl.arange(0, BLOCK_D)
++    dm = d < hs
++    g = tl.arange(0, G)
++    qh = pid_hk * G + g
++    q = tl.load(q_ptr + pid_r * q_sr + qh[:, None] * q_sh + d[None, :],
++                mask=dm[None, :], other=0.0).to(tl.float32)
++    m_i = tl.full([G], -float("inf"), tl.float32)
++    l_i = tl.zeros([G], tl.float32)
++    acc = tl.zeros([G, BLOCK_D], tl.float32)
++    nblk = (n_fac + BLOCK_N - 1) // BLOCK_N
++    per = (nblk + S - 1) // S
++    for j in range(0, per):
++        tile = pid_s * per + j
++        start = tile * BLOCK_N
++        n = start + tl.arange(0, BLOCK_N)
++        nm = n < n_fac
++        tok = tl.load(top_idx_ptr + pid_r * top_sr + pid_hk * top_sh + n,
++                      mask=nm, other=0)
++        blk = tl.load(block_table_ptr + pid_r * bt_sr + (tok // block_size),
++                      mask=nm, other=0)
++        base = (blk.to(tl.int64) * kv_sb.to(tl.int64)
++                + (tok % block_size).to(tl.int64) * kv_sp.to(tl.int64)
++                + pid_hk.to(tl.int64) * kv_sh.to(tl.int64))
++        k = tl.load(kv_cache_ptr + base[:, None] + d[None, :],
++                    mask=nm[:, None] & dm[None, :], other=0.0).to(tl.float32)
++        v = tl.load(kv_cache_ptr + base[:, None] + (hs + d[None, :]),
++                    mask=nm[:, None] & dm[None, :], other=0.0).to(tl.float32)
++        s = tl.dot(q, tl.trans(k)) * scale
++        s = tl.where(nm[None, :], s, -float("inf"))
++        m_new = tl.maximum(m_i, tl.max(s, axis=1))
++        # A split may own only empty tiles (tile >= nblk) -> m_new stays -inf ->
++        # exp(-inf-(-inf))=nan. Use a finite m_safe; the empty contributions are
++        # 0 (acc/l stay 0, m_i stays -inf so the reduce zeroes this split out).
++        m_safe = tl.where(m_new == -float("inf"), 0.0, m_new)
++        alpha = tl.exp(m_i - m_safe)
++        p = tl.exp(s - m_safe[:, None])
++        l_i = l_i * alpha + tl.sum(p, axis=1)
++        acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
++        m_i = m_new
++    tl.store(m_ptr + pid_r * m_sr + qh * m_sh + pid_s * m_ss, m_i)
++    tl.store(l_ptr + pid_r * m_sr + qh * m_sh + pid_s * m_ss, l_i)
++    tl.store(acc_ptr + pid_r * a_sr + qh[:, None] * a_sh + pid_s * a_ss + d[None, :],
++             acc, mask=dm[None, :])
++
++
++@triton.jit
++def _split_reduce_kernel(
++    m_ptr, l_ptr, acc_ptr, o_ptr,
++    hs, S,
++    m_sr, m_sh, m_ss, a_sr, a_sh, a_ss, o_sr, o_sh,
++    BLOCK_S: tl.constexpr, BLOCK_D: tl.constexpr,
++):
++    # grid (num_decodes, H_q): merge the S partials for this (request, q-head)
++    # with the online-softmax (log-sum-exp) combine.
++    pid_r = tl.program_id(0)
++    pid_hq = tl.program_id(1)
++    d = tl.arange(0, BLOCK_D)
++    dm = d < hs
++    sm = tl.arange(0, BLOCK_S)
++    smask = sm < S
++    base_m = pid_r * m_sr + pid_hq * m_sh
++    m_s = tl.load(m_ptr + base_m + sm * m_ss, mask=smask, other=-float("inf"))
++    l_s = tl.load(l_ptr + base_m + sm * m_ss, mask=smask, other=0.0)
++    m_g = tl.max(m_s)
++    alpha = tl.where(smask, tl.exp(m_s - m_g), 0.0)
++    l_g = tl.sum(l_s * alpha)
++    acc_s = tl.load(
++        acc_ptr + pid_r * a_sr + pid_hq * a_sh + sm[:, None] * a_ss + d[None, :],
++        mask=smask[:, None] & dm[None, :], other=0.0)
++    acc_g = tl.sum(acc_s * alpha[:, None], axis=0)
++    o = acc_g / l_g
++    tl.store(o_ptr + pid_r * o_sr + pid_hq * o_sh + d,
++             o.to(o_ptr.dtype.element_ty), mask=dm)
++
++
++def indexed_split_count(num_decodes, n_kv_heads, n_fac, sm_count, block_n=128):
++    """Adaptive split count S. The single pass (S=1) already saturates the SMs once the grid
++    num_decodes*H_kv reaches the SM count and wins there; below that, split the
++    n_fac scan to ~2*SM blocks for occupancy. Capped so each split keeps >=1
++    BLOCK_N tile."""
++    max_splits = max(1, (n_fac + block_n - 1) // block_n)
++    if num_decodes * n_kv_heads >= sm_count:
++        return 1
++    return min(max_splits, max(2, -(-(2 * sm_count) // (num_decodes * n_kv_heads))))
++
++
++def jssa_indexed_attend(q, kv_cache, block_table, top_idx, head_size, scale,
++                         out, scratch=None, sm_count=None):
++    """Fused gather-free attention over the top_idx-selected paged kv slots.
++
++    q          : (num_decodes, H_q, head_size)
++    kv_cache   : (num_blocks, block_size, H_kv, slot)  slot = [K | V | proj_K]
++    block_table: (num_decodes, max_blocks) int32
++    top_idx    : (num_decodes, H_kv, n_fac) int32/int64
++    out        : (num_decodes, H_q, head_size)         preallocated (CG-safe)
++    scratch    : optional (name, shape, dtype, device)->Tensor persistent-buffer
++                 allocator (jssa_attn._decode_scratch). Required CG-safety for
++                 the split path's partials; falls back to torch.empty if None.
++    sm_count   : SM count for the split heuristic (queried if None).
++
++    Returns ``out``. No host sync; with ``scratch`` provided, no allocation —
++    safe under CUDA-graph capture.
++    """
++    R, Hq, hs = q.shape
++    Hk = top_idx.shape[1]
++    n_fac = top_idx.shape[2]
++    G = Hq // Hk
++    BLOCK_D = triton.next_power_of_2(hs)
++    # head 512 (Gemma 4 full-attention layers) -> BLOCK_N*BLOCK_D fp32 tiles blow the 232KB
++    # shared-memory limit at BLOCK_N=128; shrink the tile. head<=256 keeps 128.
++    BLOCK_N = 128 if hs <= 256 else 32
++    if sm_count is None:
++        sm_count = torch.cuda.get_device_properties(q.device).multi_processor_count
++    S = indexed_split_count(R, Hk, n_fac, sm_count, BLOCK_N)
++
++    if S == 1:
++        _indexed_attend_kv_kernel[(R, Hk)](
++            q, kv_cache, block_table, top_idx, out,
++            scale, n_fac, hs, kv_cache.shape[1],
++            q.stride(0), q.stride(1),
++            kv_cache.stride(0), kv_cache.stride(1), kv_cache.stride(2),
++            block_table.stride(0), top_idx.stride(0), top_idx.stride(1),
++            out.stride(0), out.stride(1),
++            G=G, BLOCK_N=BLOCK_N, BLOCK_D=BLOCK_D,
++        )
++        return out
++
++    if scratch is None:
++        m = torch.empty((R, Hq, S), dtype=torch.float32, device=q.device)
++        l = torch.empty((R, Hq, S), dtype=torch.float32, device=q.device)
++        acc = torch.empty((R, Hq, S, BLOCK_D), dtype=torch.float32, device=q.device)
++    else:
++        m = scratch("jssa_idx_m", (R, Hq, S), torch.float32, q.device)
++        l = scratch("jssa_idx_l", (R, Hq, S), torch.float32, q.device)
++        acc = scratch("jssa_idx_acc", (R, Hq, S, BLOCK_D), torch.float32, q.device)
++    _split_attend_kernel[(R, Hk, S)](
++        q, kv_cache, block_table, top_idx, m, l, acc,
++        scale, n_fac, hs, kv_cache.shape[1], S,
++        q.stride(0), q.stride(1),
++        kv_cache.stride(0), kv_cache.stride(1), kv_cache.stride(2),
++        block_table.stride(0), top_idx.stride(0), top_idx.stride(1),
++        m.stride(0), m.stride(1), m.stride(2),
++        acc.stride(0), acc.stride(1), acc.stride(2),
++        G=G, BLOCK_N=BLOCK_N, BLOCK_D=BLOCK_D,
++    )
++    _split_reduce_kernel[(R, Hq)](
++        m, l, acc, out, hs, S,
++        m.stride(0), m.stride(1), m.stride(2),
++        acc.stride(0), acc.stride(1), acc.stride(2),
++        out.stride(0), out.stride(1),
++        BLOCK_S=triton.next_power_of_2(S), BLOCK_D=BLOCK_D,
++    )
++    return out
+diff --git a/vllm/v1/attention/ops/triton_jssa_score_topk.py b/vllm/v1/attention/ops/triton_jssa_score_topk.py
+new file mode 100644
+index 000000000..80eab2cd7
+--- /dev/null
++++ b/vllm/v1/attention/ops/triton_jssa_score_topk.py
+@@ -0,0 +1,364 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""JSSA projected score + top-B selection.
++
++``score[r, h, t] = sum_c proj_q[r, h, c] * proj_K[r, h, t, c]`` for every cached
++position t of request r and KV head h, with positions >= seq_lens[r] masked to
++-inf, followed by a per-row top-B. proj_K is read either from the proj_K region
++of the combined [K | V | proj_K] slot (bf16) or from the separate contiguous
++FP8 projected-key cache.
++
++The helpers accept pre-allocated output buffers so the decode path performs no
++allocation inside a captured CUDA graph.
++"""
++
++import torch
++
++from vllm.triton_utils import tl, triton
++
++# Row tile for the contiguous proj_K score kernel (coalesced reads favor a
++# large tile; tuned on B200 with r=32 fp8). The in-slot kernel uses 64.
++_CONTIG_SCORE_BLOCK_T = 512
++
++
++@triton.jit
++def _jssa_score_kernel(
++    proj_q_ptr,  # [num_reqs, H_kv, cs_h]
++    kv_cache_ptr,  # [num_blocks, block_size, H_kv, slot_size]
++    block_table_ptr,  # [num_reqs, max_blocks]
++    seq_lens_ptr,  # [num_reqs]
++    scores_ptr,  # [num_reqs, H_kv, max_kv_len]  fp32
++    max_kv_len,
++    head_size,
++    cs_h,
++    block_size,
++    proj_q_stride_r,
++    proj_q_stride_h,
++    cache_stride_block,
++    cache_stride_pos,
++    cache_stride_head,
++    bt_stride_r,
++    scores_stride_r,
++    scores_stride_h,
++    BLOCK_T: tl.constexpr,
++    BLOCK_C: tl.constexpr,
++):
++    pid_r = tl.program_id(0)
++    pid_h = tl.program_id(1)
++    pid_t = tl.program_id(2)
++
++    t_offs = pid_t * BLOCK_T + tl.arange(0, BLOCK_T)
++    seq_len = tl.load(seq_lens_ptr + pid_r)
++    in_range = t_offs < max_kv_len
++    # Also bound by the block-table capacity (max_kv_len == max_blocks *
++    # block_size) so every block-table / cache load stays in bounds.
++    in_seq = (t_offs < seq_len) & in_range
++
++    c_offs = tl.arange(0, BLOCK_C)
++    c_mask = c_offs < cs_h
++
++    pq = tl.load(
++        proj_q_ptr + pid_r * proj_q_stride_r + pid_h * proj_q_stride_h + c_offs,
++        mask=c_mask,
++        other=0.0,
++    ).to(tl.float32)
++
++    block_idx = t_offs // block_size
++    pos_in_block = t_offs % block_size
++    bt_offset = pid_r * bt_stride_r + block_idx
++    # int64 addressing: block_id * cache_stride_block exceeds int32 once the KV
++    # cache holds more than ~58k blocks.
++    block_id = tl.load(block_table_ptr + bt_offset, mask=in_seq, other=0).to(tl.int64)
++
++    # proj_K region starts after K (head_size) and V (head_size).
++    proj_K_base = (
++        block_id * cache_stride_block
++        + pos_in_block * cache_stride_pos
++        + pid_h * cache_stride_head
++        + 2 * head_size
++    )
++
++    proj_K = tl.load(
++        kv_cache_ptr + proj_K_base[:, None] + c_offs[None, :],
++        mask=in_seq[:, None] & c_mask[None, :],
++        other=0.0,
++    ).to(tl.float32)
++
++    score = tl.sum(proj_K * pq[None, :], axis=1)  # [BLOCK_T]
++    score = tl.where(in_seq, score, float("-inf"))
++
++    out_off = pid_r * scores_stride_r + pid_h * scores_stride_h + t_offs
++    tl.store(scores_ptr + out_off, score, mask=in_range)
++
++
++@triton.jit
++def _jssa_score_contig_kernel(
++    proj_q_ptr,  # [num_reqs, H_kv, cs_h]
++    projk_ptr,  # [num_blocks, block_size, H_kv, cs_h]  contiguous proj_K cache
++    block_table_ptr,
++    seq_lens_ptr,
++    scores_ptr,
++    max_kv_len,
++    cs_h,
++    block_size,
++    proj_q_stride_r, proj_q_stride_h,
++    pk_stride_block, pk_stride_pos, pk_stride_head,
++    bt_stride_r,
++    scores_stride_r, scores_stride_h,
++    BLOCK_T: tl.constexpr,
++    BLOCK_C: tl.constexpr,
++):
++    """Same score as _jssa_score_kernel, reading proj_K from the separate
++    contiguous cache so consecutive positions are adjacent in memory."""
++    pid_r = tl.program_id(0)
++    pid_h = tl.program_id(1)
++    pid_t = tl.program_id(2)
++
++    t_offs = pid_t * BLOCK_T + tl.arange(0, BLOCK_T)
++    seq_len = tl.load(seq_lens_ptr + pid_r)
++    in_range = t_offs < max_kv_len
++    in_seq = (t_offs < seq_len) & in_range
++
++    c_offs = tl.arange(0, BLOCK_C)
++    c_mask = c_offs < cs_h
++    pq = tl.load(
++        proj_q_ptr + pid_r * proj_q_stride_r + pid_h * proj_q_stride_h + c_offs,
++        mask=c_mask, other=0.0,
++    ).to(tl.float32)
++
++    block_idx = t_offs // block_size
++    pos_in_block = t_offs % block_size
++    block_id = tl.load(
++        block_table_ptr + pid_r * bt_stride_r + block_idx, mask=in_seq, other=0
++    ).to(tl.int64)
++    proj_K_base = (
++        block_id * pk_stride_block
++        + pos_in_block * pk_stride_pos
++        + pid_h * pk_stride_head
++    )
++    proj_K = tl.load(
++        projk_ptr + proj_K_base[:, None] + c_offs[None, :],
++        mask=in_seq[:, None] & c_mask[None, :], other=0.0,
++    ).to(tl.float32)
++
++    score = tl.sum(proj_K * pq[None, :], axis=1)
++    score = tl.where(in_seq, score, float("-inf"))
++    out_off = pid_r * scores_stride_r + pid_h * scores_stride_h + t_offs
++    tl.store(scores_ptr + out_off, score, mask=in_range)
++
++
++def jssa_score(
++    proj_q: torch.Tensor,  # (num_reqs, H_kv, cs_h)  bf16/fp16
++    kv_cache: torch.Tensor,  # (num_blocks, block_size, H_kv, slot_size)
++    block_table: torch.Tensor,  # (num_reqs, max_blocks)  int32
++    seq_lens: torch.Tensor,  # (num_reqs,)  int32
++    head_size: int,
++    cs_h: int,
++    block_t: int = 64,
++    scores_out: torch.Tensor | None = None,
++    projk_cache: torch.Tensor | None = None,
++) -> torch.Tensor:
++    """Scores for every cached position: fp32 ``(num_reqs, H_kv, max_kv_len)``
++    with positions >= seq_lens[r] set to -inf. Writes into ``scores_out`` when
++    given. ``projk_cache`` routes the read to the contiguous proj_K cache."""
++    num_reqs, H_kv, cs_h_q = proj_q.shape
++    assert cs_h_q == cs_h, f"proj_q.shape[-1] {cs_h_q} != cs_h {cs_h}"
++    block_size = kv_cache.shape[1]
++    max_blocks = block_table.shape[1]
++    max_kv_len = max_blocks * block_size
++
++    if scores_out is None:
++        scores = torch.empty(
++            (num_reqs, H_kv, max_kv_len),
++            dtype=torch.float32,
++            device=proj_q.device,
++        )
++    else:
++        assert scores_out.shape[0] >= num_reqs and scores_out.shape[1] == H_kv
++        assert scores_out.shape[-1] >= max_kv_len
++        scores = scores_out[:num_reqs, :, :max_kv_len]
++
++    BLOCK_C = triton.next_power_of_2(cs_h)
++    if projk_cache is not None:
++        BLOCK_T = _CONTIG_SCORE_BLOCK_T
++        grid = (num_reqs, H_kv, triton.cdiv(max_kv_len, BLOCK_T))
++        _jssa_score_contig_kernel[grid](
++            proj_q, projk_cache, block_table, seq_lens, scores,
++            max_kv_len, cs_h, block_size,
++            proj_q.stride(0), proj_q.stride(1),
++            projk_cache.stride(0), projk_cache.stride(1), projk_cache.stride(2),
++            block_table.stride(0), scores.stride(0), scores.stride(1),
++            BLOCK_T=BLOCK_T, BLOCK_C=BLOCK_C,
++        )
++        return scores
++
++    BLOCK_T = block_t
++    grid = (num_reqs, H_kv, triton.cdiv(max_kv_len, BLOCK_T))
++    _jssa_score_kernel[grid](
++        proj_q,
++        kv_cache,
++        block_table,
++        seq_lens,
++        scores,
++        max_kv_len,
++        head_size,
++        cs_h,
++        block_size,
++        proj_q.stride(0),
++        proj_q.stride(1),
++        kv_cache.stride(0),
++        kv_cache.stride(1),
++        kv_cache.stride(2),
++        block_table.stride(0),
++        scores.stride(0),
++        scores.stride(1),
++        BLOCK_T=BLOCK_T,
++        BLOCK_C=BLOCK_C,
++    )
++    return scores
++
++
++def _radix_topk_available() -> bool:
++    """True iff vLLM's radix top-k binding (csrc/topk.cu, used by DeepSeek
++    Sparse Attention) is compiled in. It is O(seq) vs torch.topk's full sort."""
++    if not hasattr(torch.ops._C, "top_k_per_row_decode"):
++        try:
++            import vllm._custom_ops  # noqa: F401  (registers the torch ops)
++        except Exception:
++            return False
++    return hasattr(torch.ops._C, "top_k_per_row_decode")
++
++
++# Shape-keyed persistent scratch for the radix path: allocations inside the
++# captured decode path would come from the graph pool and alias at batch > 1.
++_RADIX_SCRATCH: dict = {}
++
++
++def _radix_scratch(name, shape, dtype, device):
++    key = (name, tuple(shape), dtype, device)
++    t = _RADIX_SCRATCH.get(key)
++    if t is None:
++        t = torch.empty(shape, dtype=dtype, device=device)
++        _RADIX_SCRATCH[key] = t
++    return t
++
++
++def _radix_topk(
++    scores: torch.Tensor,  # (num_reqs, H_kv, max_kv_len) fp32
++    seq_lens: torch.Tensor,  # (num_reqs,) int32
++    k: int,
++    idx_out: torch.Tensor | None = None,  # (num_reqs, H_kv, k) int32
++) -> torch.Tensor:
++    """Radix top-k over the last dim. Returns int32 (num_reqs, H_kv, k) indices,
++    not sorted by score (the attention only needs the set). Allocation-free."""
++    num_reqs, H_kv, max_kv = scores.shape
++    rows = num_reqs * H_kv
++    dev = scores.device
++    logits2d = _radix_scratch("logits", (rows, max_kv), torch.float32, dev)
++    logits2d.view(num_reqs, H_kv, max_kv).copy_(scores)
++    seq_lens_rows = _radix_scratch("seqrows", (rows,), torch.int32, dev)
++    seq_lens_rows.view(num_reqs, H_kv).copy_(
++        seq_lens.to(torch.int32).view(num_reqs, 1).expand(num_reqs, H_kv)
++    )
++    topk_idx = _radix_scratch("topk", (rows, k), torch.int32, dev)
++    next_n = 1  # one query token per decode step
++    torch.ops._C.top_k_per_row_decode(
++        logits2d, next_n, seq_lens_rows, topk_idx, rows,
++        logits2d.stride(0), logits2d.stride(1), k,
++    )
++    # When seq_len < k the kernel pads unfilled slots with -1, which would be an
++    # out-of-bounds read in the attention. Replace every invalid slot (negative
++    # or >= seq_len) by cycling through the real tokens [0, seq_len): the
++    # attention then covers every real token with near-equal multiplicity
++    # (exact when k % seq_len == 0), never an unwritten cache slot.
++    res = _radix_scratch("res", (rows, k), torch.int32, dev)
++    slot_off = _radix_scratch("slotoff", (k,), torch.int32, dev)
++    torch.arange(k, out=slot_off)
++    sl = _radix_scratch("sl", (rows, 1), torch.int32, dev)  # avoid modulo-by-zero
++    torch.clamp(seq_lens_rows.view(rows, 1), min=1, out=sl)
++    fill = _radix_scratch("fill", (rows, k), torch.int32, dev)
++    torch.remainder(slot_off.view(1, k).expand(rows, k), sl, out=fill)
++    neg = _radix_scratch("neg", (rows, k), torch.bool, dev)
++    torch.lt(topk_idx, 0, out=neg)
++    oob = _radix_scratch("oob", (rows, k), torch.bool, dev)
++    torch.ge(topk_idx, seq_lens_rows.view(rows, 1), out=oob)
++    torch.logical_or(neg, oob, out=neg)
++    torch.where(neg, fill, topk_idx, out=res)
++    out3d = res.view(num_reqs, H_kv, k)
++    if idx_out is not None:
++        idx_out[:num_reqs, :, :k].copy_(out3d)
++        return idx_out[:num_reqs, :, :k]
++    return out3d
++
++
++def jssa_score_topk(
++    proj_q: torch.Tensor,
++    kv_cache: torch.Tensor,
++    block_table: torch.Tensor,
++    seq_lens: torch.Tensor,
++    n_fac: int,
++    head_size: int,
++    cs_h: int,
++    scores_out: torch.Tensor | None = None,
++    top_idx_out: torch.Tensor | None = None,
++    top_scores_out: torch.Tensor | None = None,
++    use_radix: bool = True,
++    projk_cache: torch.Tensor | None = None,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """Score -> top-B. Returns ``(top_idx, top_scores)`` shaped
++    ``(num_reqs, H_kv, k)`` with ``k = min(n_fac, max_kv_len)``. With
++    pre-allocated buffers, ``top_idx_out`` may be int32 (radix, or torch.topk
++    copied in) or int64 (torch.topk). Without buffers, int32 indices."""
++    scores = jssa_score(
++        proj_q,
++        kv_cache,
++        block_table,
++        seq_lens,
++        head_size,
++        cs_h,
++        scores_out=scores_out,
++        projk_cache=projk_cache,
++    )
++    k = min(n_fac, scores.shape[-1])
++    use_radix_eff = use_radix and _radix_topk_available()
++
++    if top_idx_out is not None and top_scores_out is not None:
++        num_reqs, H_kv, _ = scores.shape
++        assert top_scores_out.dtype == torch.float32
++        assert (
++            top_idx_out.shape[0] >= num_reqs
++            and top_idx_out.shape[1] == H_kv
++            and top_idx_out.shape[-1] >= k
++        ), (
++            f"top_idx_out shape {tuple(top_idx_out.shape)} too small for "
++            f"({num_reqs}, {H_kv}, {k})"
++        )
++        if use_radix_eff and top_idx_out.dtype == torch.int32:
++            idx_view = _radix_topk(scores, seq_lens, k, idx_out=top_idx_out)
++            score_view = top_scores_out[:num_reqs, :, :k]
++            torch.gather(scores, -1, idx_view.to(torch.int64), out=score_view)
++            return idx_view, score_view
++        if top_idx_out.dtype == torch.int32:
++            # int32 buffer without the radix binding: torch.topk(out=) needs
++            # int64, so compute and copy in.
++            ts, ti = torch.topk(scores, k=k, dim=-1)
++            idx_view = top_idx_out[:num_reqs, :, :k]
++            score_view = top_scores_out[:num_reqs, :, :k]
++            idx_view.copy_(ti.to(torch.int32))
++            score_view.copy_(ts)
++            return idx_view, score_view
++        assert top_idx_out.dtype == torch.int64, (
++            "top_idx_out must be int32 or int64"
++        )
++        idx_view = top_idx_out[:num_reqs, :, :k]
++        score_view = top_scores_out[:num_reqs, :, :k]
++        torch.topk(scores, k=k, dim=-1, out=(score_view, idx_view))
++        return idx_view, score_view
++
++    if use_radix_eff:
++        top_idx = _radix_topk(scores, seq_lens, k)
++        top_scores = torch.gather(scores, -1, top_idx.to(torch.int64))
++        return top_idx, top_scores
++
++    top_scores, top_idx = torch.topk(scores, k=k, dim=-1)
++    return top_idx.to(torch.int32), top_scores
+diff --git a/vllm/v1/attention/ops/triton_jssa_store.py b/vllm/v1/attention/ops/triton_jssa_store.py
+new file mode 100644
+index 000000000..036f54845
+--- /dev/null
++++ b/vllm/v1/attention/ops/triton_jssa_store.py
+@@ -0,0 +1,320 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""JSSA KV-cache store kernels.
++
++Combined slot per (token, KV head):
++    elems:    0───────head_size───────2*head_size─────2*head_size + r
++    content:  [        K          |        V         |      proj_K       ]
++
++Public entries:
++    jssa_store(...)                          K + V only (layers without a basis).
++    jssa_project_and_store(...)              K + V + bf16 proj_K = M @ K in the slot.
++    jssa_project_and_store_contig_fp8(...)   K + V in the slot; (M @ K) / scale in
++                                             the separate contiguous FP8 cache.
++"""
++
++import torch
++
++from vllm.triton_utils import tl, triton
++
++# ---------------------------------------------------------------------------
++# K + V only
++# ---------------------------------------------------------------------------
++
++
++@triton.jit
++def _jssa_store_kv_kernel(
++    key_ptr,  # [num_tokens, num_kv_heads, head_size]
++    value_ptr,  # [num_tokens, num_kv_heads, head_size]
++    kv_cache_ptr,  # [num_blocks, block_size, num_kv_heads, slot_size]
++    slot_mapping_ptr,  # [num_tokens]
++    num_tokens,
++    head_size,
++    block_size,
++    key_stride_t,
++    key_stride_h,
++    val_stride_t,
++    val_stride_h,
++    cache_stride_block,
++    cache_stride_pos,
++    cache_stride_head,
++    BLOCK_D: tl.constexpr,
++):
++    token_id = tl.program_id(0)
++    head_id = tl.program_id(1)
++
++    if token_id >= num_tokens:
++        return
++
++    slot = tl.load(slot_mapping_ptr + token_id)
++    if slot < 0:
++        return
++
++    block_id = slot // block_size
++    pos = slot % block_size
++
++    d_offs = tl.arange(0, BLOCK_D)
++    mask = d_offs < head_size
++
++    k_offset = token_id * key_stride_t + head_id * key_stride_h
++    k = tl.load(key_ptr + k_offset + d_offs, mask=mask, other=0.0)
++
++    v_offset = token_id * val_stride_t + head_id * val_stride_h
++    v = tl.load(value_ptr + v_offset + d_offs, mask=mask, other=0.0)
++
++    cache_offset = (
++        block_id * cache_stride_block
++        + pos * cache_stride_pos
++        + head_id * cache_stride_head
++    )
++
++    tl.store(kv_cache_ptr + cache_offset + d_offs, k, mask=mask)
++    tl.store(kv_cache_ptr + cache_offset + head_size + d_offs, v, mask=mask)
++    # proj_K region [2*head_size : 2*head_size + cs_h] left untouched.
++
++
++def jssa_store(
++    key: torch.Tensor,  # (num_tokens, num_kv_heads, head_size)
++    value: torch.Tensor,  # (num_tokens, num_kv_heads, head_size)
++    kv_cache: torch.Tensor,  # (num_blocks, block_size, num_kv_heads, slot_size)
++    slot_mapping: torch.Tensor,
++) -> None:
++    """Write K and V into the combined JSSA slot, leaving proj_K untouched."""
++    num_tokens, num_kv_heads, head_size = key.shape
++    if num_tokens == 0:
++        return
++
++    BLOCK_D = triton.next_power_of_2(head_size)
++    grid = (num_tokens, num_kv_heads)
++
++    _jssa_store_kv_kernel[grid](
++        key,
++        value,
++        kv_cache,
++        slot_mapping,
++        num_tokens,
++        head_size,
++        kv_cache.shape[1],
++        key.stride(0),
++        key.stride(1),
++        value.stride(0),
++        value.stride(1),
++        kv_cache.stride(0),
++        kv_cache.stride(1),
++        kv_cache.stride(2),
++        BLOCK_D=BLOCK_D,
++    )
++
++
++# ---------------------------------------------------------------------------
++# Fused project + store (K + V + proj_K = M @ K)
++# ---------------------------------------------------------------------------
++
++
++@triton.jit
++def _jssa_project_store_kernel(
++    key_ptr,  # [num_tokens, num_kv_heads, head_size]
++    value_ptr,  # [num_tokens, num_kv_heads, head_size]
++    m_ptr,  # [num_kv_heads, cs_h, head_size]
++    kv_cache_ptr,  # [num_blocks, block_size, num_kv_heads, slot_size]
++    slot_mapping_ptr,  # [num_tokens]
++    num_tokens,
++    head_size,
++    cs_h,
++    block_size,
++    key_stride_t,
++    key_stride_h,
++    val_stride_t,
++    val_stride_h,
++    m_stride_h,
++    m_stride_c,
++    cache_stride_block,
++    cache_stride_pos,
++    cache_stride_head,
++    BLOCK_D: tl.constexpr,
++    BLOCK_C: tl.constexpr,
++):
++    token_id = tl.program_id(0)
++    head_id = tl.program_id(1)
++
++    if token_id >= num_tokens:
++        return
++
++    slot = tl.load(slot_mapping_ptr + token_id)
++    if slot < 0:
++        return
++
++    block_id = slot // block_size
++    pos = slot % block_size
++
++    d_offs = tl.arange(0, BLOCK_D)
++    d_mask = d_offs < head_size
++    c_offs = tl.arange(0, BLOCK_C)
++    c_mask = c_offs < cs_h
++
++    # Load K and V vectors for this (token, head).
++    k_offset = token_id * key_stride_t + head_id * key_stride_h
++    k = tl.load(key_ptr + k_offset + d_offs, mask=d_mask, other=0.0)
++    v_offset = token_id * val_stride_t + head_id * val_stride_h
++    v = tl.load(value_ptr + v_offset + d_offs, mask=d_mask, other=0.0)
++
++    # Compute proj_K = M[head] @ K, accumulated in fp32.
++    # M[head] shape: (cs_h, head_size); loaded as a (BLOCK_C, BLOCK_D) tile.
++    m_block_ptr = m_ptr + head_id * m_stride_h
++    m_offs = c_offs[:, None] * m_stride_c + d_offs[None, :]
++    m_mask = c_mask[:, None] & d_mask[None, :]
++    m_tile = tl.load(m_block_ptr + m_offs, mask=m_mask, other=0.0)
++    proj_f32 = tl.sum(m_tile * k[None, :].to(tl.float32), axis=1)
++    proj = proj_f32.to(k.dtype)
++
++    # Slot base for this (block, pos, head).
++    cache_offset = (
++        block_id * cache_stride_block
++        + pos * cache_stride_pos
++        + head_id * cache_stride_head
++    )
++
++    # Write K → slot[0 : head_size]
++    tl.store(kv_cache_ptr + cache_offset + d_offs, k, mask=d_mask)
++    # Write V → slot[head_size : 2*head_size]
++    tl.store(kv_cache_ptr + cache_offset + head_size + d_offs, v, mask=d_mask)
++    # Write proj_K → slot[2*head_size : 2*head_size + cs_h]
++    tl.store(
++        kv_cache_ptr + cache_offset + 2 * head_size + c_offs,
++        proj,
++        mask=c_mask,
++    )
++
++
++
++@triton.jit
++def _jssa_project_store_contig_fp8_kernel(
++    key_ptr, value_ptr, m_ptr,
++    kv_cache_ptr,    # [num_blocks, block_size, H_kv, slot_size]  ([K|V])
++    projk_ptr,       # [num_blocks, block_size, H_kv, cs_h]  FP8 proj_K
++    scale_ptr,       # [H_kv, cs_h]  per-(head,channel) fp8 scale
++    slot_mapping_ptr,
++    num_tokens, head_size, cs_h, block_size,
++    key_stride_t, key_stride_h, val_stride_t, val_stride_h,
++    m_stride_h, m_stride_c, scale_stride_h,
++    cache_stride_block, cache_stride_pos, cache_stride_head,
++    pk_stride_block, pk_stride_pos, pk_stride_head,
++    BLOCK_D: tl.constexpr, BLOCK_C: tl.constexpr,
++):
++    token_id = tl.program_id(0)
++    head_id = tl.program_id(1)
++    if token_id >= num_tokens:
++        return
++    slot = tl.load(slot_mapping_ptr + token_id)
++    if slot < 0:
++        return
++    block_id = (slot // block_size).to(tl.int64)
++    pos = slot % block_size
++    d_offs = tl.arange(0, BLOCK_D)
++    d_mask = d_offs < head_size
++    c_offs = tl.arange(0, BLOCK_C)
++    c_mask = c_offs < cs_h
++
++    k_offset = token_id * key_stride_t + head_id * key_stride_h
++    k = tl.load(key_ptr + k_offset + d_offs, mask=d_mask, other=0.0)
++    v_offset = token_id * val_stride_t + head_id * val_stride_h
++    v = tl.load(value_ptr + v_offset + d_offs, mask=d_mask, other=0.0)
++
++    m_block_ptr = m_ptr + head_id * m_stride_h
++    m_offs = c_offs[:, None] * m_stride_c + d_offs[None, :]
++    m_mask = c_mask[:, None] & d_mask[None, :]
++    m_tile = tl.load(m_block_ptr + m_offs, mask=m_mask, other=0.0)
++    proj = tl.sum(m_tile * k[None, :].to(tl.float32), axis=1)  # fp32 [BLOCK_C]
++    # Divide by the per-channel scale, then cast to fp8 (the score folds the
++    # same scale into proj_q, so the dot recovers proj_q·proj_K up to fp8 round).
++    sc = tl.load(scale_ptr + head_id * scale_stride_h + c_offs, mask=c_mask, other=1.0)
++    proj_q8 = (proj / sc).to(projk_ptr.dtype.element_ty)
++
++    cache_offset = (
++        block_id * cache_stride_block + pos * cache_stride_pos
++        + head_id * cache_stride_head
++    )
++    tl.store(kv_cache_ptr + cache_offset + d_offs, k, mask=d_mask)
++    tl.store(kv_cache_ptr + cache_offset + head_size + d_offs, v, mask=d_mask)
++    pk_offset = (
++        block_id * pk_stride_block + pos * pk_stride_pos + head_id * pk_stride_head
++    )
++    tl.store(projk_ptr + pk_offset + c_offs, proj_q8, mask=c_mask)
++
++
++def jssa_project_and_store_contig_fp8(
++    key: torch.Tensor,
++    value: torch.Tensor,
++    kv_cache: torch.Tensor,
++    projk_cache: torch.Tensor,  # fp8 [num_blocks, block_size, H_kv, cs_h]
++    scale: torch.Tensor,        # [H_kv, cs_h] per-channel fp8 scale
++    slot_mapping: torch.Tensor,
++    M: torch.Tensor,
++) -> None:
++    """K,V -> [K|V] slot; proj_K = (M@K)/scale -> FP8 contiguous projk_cache."""
++    num_tokens, num_kv_heads, head_size = key.shape
++    if num_tokens == 0:
++        return
++    _, cs_h, _ = M.shape
++    BLOCK_D = triton.next_power_of_2(head_size)
++    BLOCK_C = triton.next_power_of_2(cs_h)
++    _jssa_project_store_contig_fp8_kernel[(num_tokens, num_kv_heads)](
++        key, value, M, kv_cache, projk_cache, scale, slot_mapping,
++        num_tokens, head_size, cs_h, kv_cache.shape[1],
++        key.stride(0), key.stride(1), value.stride(0), value.stride(1),
++        M.stride(0), M.stride(1), scale.stride(0),
++        kv_cache.stride(0), kv_cache.stride(1), kv_cache.stride(2),
++        projk_cache.stride(0), projk_cache.stride(1), projk_cache.stride(2),
++        BLOCK_D=BLOCK_D, BLOCK_C=BLOCK_C,
++    )
++
++
++
++def jssa_project_and_store(
++    key: torch.Tensor,  # (num_tokens, num_kv_heads, head_size)
++    value: torch.Tensor,  # (num_tokens, num_kv_heads, head_size)
++    kv_cache: torch.Tensor,  # (num_blocks, block_size, num_kv_heads, slot_size)
++    slot_mapping: torch.Tensor,
++    M: torch.Tensor,  # (num_kv_heads, cs_h, head_size)
++) -> None:
++    """Write K, V, and proj_K = M @ K into the combined JSSA slot."""
++    num_tokens, num_kv_heads, head_size = key.shape
++    if num_tokens == 0:
++        return
++
++    M_h, cs_h, M_d = M.shape
++    assert M_h == num_kv_heads and M_d == head_size, (
++        f"M shape mismatch: got {tuple(M.shape)}, expected "
++        f"({num_kv_heads}, cs_h, {head_size})"
++    )
++    assert kv_cache.shape[-1] >= 2 * head_size + cs_h, (
++        f"slot_size {kv_cache.shape[-1]} too small for "
++        f"2 * head_size ({2 * head_size}) + cs_h ({cs_h})"
++    )
++
++    BLOCK_D = triton.next_power_of_2(head_size)
++    BLOCK_C = triton.next_power_of_2(cs_h)
++    grid = (num_tokens, num_kv_heads)
++
++    _jssa_project_store_kernel[grid](
++        key,
++        value,
++        M,
++        kv_cache,
++        slot_mapping,
++        num_tokens,
++        head_size,
++        cs_h,
++        kv_cache.shape[1],
++        key.stride(0),
++        key.stride(1),
++        value.stride(0),
++        value.stride(1),
++        M.stride(0),
++        M.stride(1),
++        kv_cache.stride(0),
++        kv_cache.stride(1),
++        kv_cache.stride(2),
++        BLOCK_D=BLOCK_D,
++        BLOCK_C=BLOCK_C,
++    )
+diff --git a/vllm/v1/attention/selector.py b/vllm/v1/attention/selector.py
+index d98de6966..465b39762 100644
+--- a/vllm/v1/attention/selector.py
++++ b/vllm/v1/attention/selector.py
+@@ -95,11 +95,26 @@ def get_attn_backend(
+         use_batch_invariant=envs.VLLM_BATCH_INVARIANT,
+     )
+ 
+-    return _cached_get_attn_backend(
+-        backend=vllm_config.attention_config.backend,
+-        attn_selector_config=attn_selector_config,
+-        num_heads=num_heads,
+-    )
++    forced_backend = vllm_config.attention_config.backend
++    try:
++        return _cached_get_attn_backend(
++            backend=forced_backend,
++            attn_selector_config=attn_selector_config,
++            num_heads=num_heads,
++        )
++    except ValueError as e:
++        # A forced JSSA backend only supports its own kv_cache_dtype. On hybrid
++        # models the layers excluded via kv_cache_dtype_skip_layers (e.g. the
++        # Gemma 4 sliding layers -> "auto") fall back to auto-selection, i.e.
++        # the standard backend with a window-bounded SlidingWindowSpec; the
++        # global layers keep the JSSA backend.
++        if forced_backend is not None and "kv_cache_dtype not supported" in str(e):
++            return _cached_get_attn_backend(
++                backend=None,
++                attn_selector_config=attn_selector_config,
++                num_heads=num_heads,
++            )
++        raise
+ 
+ 
+ @cache
+diff --git a/vllm/v1/core/kv_cache_utils.py b/vllm/v1/core/kv_cache_utils.py
+index 7f3a5e4fd..a2c306354 100644
+--- a/vllm/v1/core/kv_cache_utils.py
++++ b/vllm/v1/core/kv_cache_utils.py
+@@ -1029,22 +1029,32 @@ def unify_kv_cache_spec_page_size(
+         # All layers have the same page size, no need to unify.
+         return kv_cache_spec
+ 
+-    max_page_size = max(page_sizes)
++    # Unify to the LEAST COMMON MULTIPLE of the distinct page sizes (not just the
++    # max). Every layer then scales its block_size up by target/page, so the
++    # unified page size is divisible for all — no slot waste, only coarser block
++    # granularity. When the pages are already mutually divisible (the common
++    # case, e.g. standard full=1024 + sliding=512), LCM == max, so this is a
++    # no-op vs the old max-only logic. It additionally handles non-divisible
++    # mixes, e.g. a JSSA combined slot (2*hd + proj_K, e.g. 1088B) alongside a
++    # standard sliding-window slot (512B): old code raised NotImplementedError;
++    # now they unify (LCM=8704 -> full block*8, sliding block*17), letting the
++    # sliding layers stay window-bounded instead of forced to full-length.
++    from math import gcd
++
++    target = 1
++    for ps in page_sizes:
++        target = target * ps // gcd(target, ps)
+     new_kv_cache_spec = {}
+     for layer_name, layer_spec in kv_cache_spec.items():
+-        if layer_spec.page_size_bytes == max_page_size:
++        page = layer_spec.page_size_bytes
++        if page == target:
+             new_kv_cache_spec[layer_name] = layer_spec
+         else:
+-            layer_page_size = layer_spec.page_size_bytes
+-            if max_page_size % layer_page_size != 0:
+-                raise NotImplementedError(
+-                    "The page size of the layer is not divisible by the "
+-                    "maximum page size. Cannot unify by adjusting block_size."
+-                )
+-            ratio = max_page_size // layer_page_size
+-            new_block_size = layer_spec.block_size * ratio
+-            new_spec = replace(layer_spec, block_size=new_block_size)
+-            assert new_spec.page_size_bytes == max_page_size
++            ratio = target // page
++            new_spec = replace(layer_spec, block_size=layer_spec.block_size * ratio)
++            assert new_spec.page_size_bytes == target, (
++                f"page-size unification failed: {new_spec.page_size_bytes} != {target}"
++            )
+             new_kv_cache_spec[layer_name] = new_spec
+     return new_kv_cache_spec
+ 
+diff --git a/vllm/v1/core/single_type_kv_cache_manager.py b/vllm/v1/core/single_type_kv_cache_manager.py
+index e29919022..f0ef1e829 100644
+--- a/vllm/v1/core/single_type_kv_cache_manager.py
++++ b/vllm/v1/core/single_type_kv_cache_manager.py
+@@ -18,6 +18,7 @@ from vllm.v1.kv_cache_interface import (
+     FullAttentionSpec,
+     HiddenStateCacheSpec,
+     KVCacheSpec,
++    JSSAFullAttentionSpec,
+     MambaSpec,
+     MLAAttentionSpec,
+     SinkFullAttentionSpec,
+@@ -237,7 +238,11 @@ class SingleTypeKVCacheManager(ABC):
+                 cdiv(num_total_computed_tokens, self.block_size) - len(req_blocks)
+             )
+             req_blocks.extend(allocated_blocks)
+-            if type(self.kv_cache_spec) in (FullAttentionSpec, TQFullAttentionSpec):
++            if type(self.kv_cache_spec) in (
++                FullAttentionSpec,
++                TQFullAttentionSpec,
++                JSSAFullAttentionSpec,
++            ):
+                 self.new_block_ids.extend(b.block_id for b in allocated_blocks)
+ 
+     def allocate_new_blocks(
+@@ -265,7 +270,11 @@ class SingleTypeKVCacheManager(ABC):
+         else:
+             new_blocks = self.block_pool.get_new_blocks(num_new_blocks)
+             req_blocks.extend(new_blocks)
+-            if type(self.kv_cache_spec) in (FullAttentionSpec, TQFullAttentionSpec):
++            if type(self.kv_cache_spec) in (
++                FullAttentionSpec,
++                TQFullAttentionSpec,
++                JSSAFullAttentionSpec,
++            ):
+                 self.new_block_ids.extend(b.block_id for b in new_blocks)
+             return new_blocks
+ 
+@@ -1200,6 +1209,7 @@ class SinkFullAttentionManager(FullAttentionManager):
+ spec_manager_map: dict[type[KVCacheSpec], type[SingleTypeKVCacheManager]] = {
+     FullAttentionSpec: FullAttentionManager,
+     TQFullAttentionSpec: FullAttentionManager,
++    JSSAFullAttentionSpec: FullAttentionManager,
+     MLAAttentionSpec: FullAttentionManager,
+     HiddenStateCacheSpec: FullAttentionManager,
+     SlidingWindowSpec: SlidingWindowManager,
+diff --git a/vllm/v1/kv_cache_interface.py b/vllm/v1/kv_cache_interface.py
+index 31ee89bc7..94e891da8 100644
+--- a/vllm/v1/kv_cache_interface.py
++++ b/vllm/v1/kv_cache_interface.py
+@@ -333,6 +333,33 @@ class TQFullAttentionSpec(FullAttentionSpec):
+         return replace(merged, tq_slot_size=specs[0].tq_slot_size)
+ 
+ 
++@dataclass(frozen=True, kw_only=True)
++class JSSAFullAttentionSpec(FullAttentionSpec):
++    """FullAttentionSpec for the JSSA combined-slot KV cache.
++
++    Each slot packs [K | V | proj_K] for one (token, kv_head); jssa_slot_size
++    is the per-slot byte count. Mirrors TQFullAttentionSpec's override pattern
++    so vLLM's memory budgeter sizes the cache correctly.
++    """
++
++    jssa_slot_size: int = 0
++
++    @property
++    def real_page_size_bytes(self) -> int:
++        if self.jssa_slot_size > 0:
++            return self.block_size * self.num_kv_heads * self.jssa_slot_size
++        return super().real_page_size_bytes
++
++    @classmethod
++    def merge(cls, specs: list[Self]) -> Self:
++        merged = super().merge(specs)
++        assert all(s.jssa_slot_size == specs[0].jssa_slot_size for s in specs), (
++            "All JSSA layers in the same KV cache group must use the same "
++            "jssa_slot_size."
++        )
++        return replace(merged, jssa_slot_size=specs[0].jssa_slot_size)
++
++
+ @dataclass(frozen=True, kw_only=True)
+ class MLAAttentionSpec(FullAttentionSpec):
+     # TODO(Lucas/Chen): less hacky way to do this
+diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
+index 0dcf1614f..16bf3c37c 100644
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -66,6 +66,35 @@ from .utils import request_memory
+ 
+ logger = init_logger(__name__)
+ 
++
++def _jssa_decode_buffer_reservation(vllm_config) -> int:
++    """Bytes the JSSA metadata builder allocates for its per-step decode
++    buffers (sized by max_num_seqs). The builder is constructed after memory
++    profiling, so these are reserved here to keep them inside the KV budget.
++    Conservative upper bound. 0 for every other kv_cache_dtype."""
++    if vllm_config.cache_config.cache_dtype != "jssa":
++        return 0
++    mc = vllm_config.model_config
++    pc = vllm_config.parallel_config
++    ac = vllm_config.attention_config
++    mns = vllm_config.scheduler_config.max_num_seqs
++    H_kv = mc.get_num_kv_heads(pc)
++    d = mc.get_head_size()
++    L = mc.max_model_len
++
++    def _align(x, a):
++        return ((x + a - 1) // a) * a
++
++    n_fac = int(getattr(ac, "jssa_budget", 2048))
++    # K_sel + V_sel (bf16), the dominant term at large B.
++    ksel = 2 * mns * n_fac * H_kv * d * 2
++    # score scratch (fp32, aligned to 128 over max_model_len).
++    scores = mns * H_kv * _align(L, 128) * 4
++    # top-k index / score buffers.
++    topk = mns * H_kv * n_fac * (8 + 4 + 4)
++    return ksel + scores + topk
++
++
+ if TYPE_CHECKING:
+     from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
+     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+@@ -446,6 +475,17 @@ class Worker(WorkerBase):
+             - cudagraph_memory_estimate_applied
+         )
+ 
++        # The JSSA backend allocates per-step decode buffers sized by
++        # max_num_seqs after profiling; reserve them here. No-op otherwise.
++        aux = _jssa_decode_buffer_reservation(self.vllm_config)
++        if aux > 0:
++            logger.info_once(
++                "Reserving %s GiB for JSSA decode buffers (max_num_seqs=%d).",
++                format_gib(aux),
++                self.vllm_config.scheduler_config.max_num_seqs,
++            )
++            self.available_kv_cache_memory_bytes -= aux
++
+         unrequested_memory = self.init_snapshot.free_memory - self.requested_memory
+         logger.debug(
+             "Initial free memory: %s GiB; Requested memory: %f (util), %s GiB",
